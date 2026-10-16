@@ -1,0 +1,2351 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Boids · 丝带初态 · 极限环 · 打乱恢复</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    width: 100%; height: 100%;
+    overflow: hidden;
+    background: #03060f;
+    cursor: none;
+  }
+  canvas { display: block; position: absolute; top: 0; left: 0; }
+  #hud { pointer-events: none; }
+</style>
+</head>
+<body>
+<canvas id="scene"></canvas>
+<canvas id="hud"></canvas>
+
+<script>
+/* ============================================================================
+   Boids · 丝带初态 · 极限环 · 打乱-恢复
+   ----------------------------------------------------------------------------
+   三个现象的成因与可观测性：
+
+   1) 局部小圈打转（原版的主要毛病）
+      根因：全体鸟各自和"邻居的平均速度"对齐，缺乏统一的转向，
+            鸟群会碎成很多互不同向的小涡旋，各自原地打转。
+      处理：引入"手性锁定的切向扭矩"（spin drive）——
+            全体鸟被同一个转向（chirality）驱动做切向运动，
+            切向速度不够时才施加扭矩；半径越小扭矩越弱（SPIN_KILL_RATIO），
+            于是不会退化成小圈打转，而是被迫扩成大尺度环流。
+
+   2) 极限环不明显
+      根因：原来的"反塌缩力 + 去旋转力"是纯阻尼项，会把振荡抹平，
+            极限环即使出现也很快衰减成静止的一团。
+      处理：三段机制叠加
+            · 有序度闸门 millGate：环流越有序，允许的环越大（自持成环）
+            · 径向迟滞反馈 hyst：smoothedR 滞后于真实半径 → 半径自持振荡
+            · 半径继电器 relay：高速大环段持续一段时间后逐渐内缩，
+              缩到阈值以下切回低速段 → 环流减弱、内聚把小环收得更紧，
+              收小后扭矩变弱又重新向外膨胀
+            → "成形 → 膨胀 → 回缩 → 再成形"的周期自己反复发生。
+
+   3) 打乱后恢复不明显
+      根因：原来只做了小幅速度扰动，环流几乎没被打断。
+      处理：全局打乱（速度方向随机化 + 位置抖散）把环流抹平到接近 0，
+            随后靠 切向扭矩 / 相邻对齐 重新组织出同向环流，
+            可在 HUD 曲线上看到"掉到 0 → 数秒内重新爬升"的完整过程。
+            鼠标=游隼仍保留局部惊散。
+   ========================================================================== */
+
+// ═══════════════════════════════════════════════════════
+// ★★★ 用户配置 ★★★
+// ═══════════════════════════════════════════════════════
+const BIRD_COUNT = 750;          // 鸟群数量
+const BIRD_SIZE_BASE = 7;        // 每只鸟的大小（3=小 6=中 9=大）
+/* 可用 ?birds=900 覆盖的鸟数（初始 = BIRD_COUNT） */
+let birdCount = BIRD_COUNT;
+/* 是否启用"鼠标=游隼"惊散（可用 ?predator=0 关闭） */
+let predatorEnabled = true;
+
+const RIBBON_LENGTH_RATIO = 0.86;    // 丝带长度 = 屏幕宽度 × 此值
+const RIBBON_THICKNESS_RATIO = 0.05; // 丝带厚度 = 屏幕高度 × 此值
+const RIBBON_ANGLE = -0.18;          // 丝带倾角（弧度，负=向右上）
+
+const CONFIG = {
+  /* ---- 屏幕适配 ---- */
+  REF_AREA: 1920 * 1080,   // 参考面积，按 √(W·H/参考面积) 缩放
+  PERCEPTION_K: 0.055,     // 感知半径 = 对角线 × 此值
+                           // 方案3：带子收紧后邻居数暴涨(176/只)，缩小它 → 方向精度不变、耗时腰斩
+  SIZE_K: 0.0030,          // 鸟体尺寸 = 对角线 × 此值（再乘 √BIRD_SIZE_BASE/7）
+  /* 小窗口里同样数量的鸟更拥挤，分离/对齐的合力会压过自旋力矩，
+     结果是又缩成一小团原地打转。按面积比做幂次补偿，使各分辨率表现一致。 */
+  DENSITY_POW: 0.50,
+
+  /* ---- 初始丝带形态 ---- */
+  RIBBON_LENGTH_RATIO: RIBBON_LENGTH_RATIO,
+  RIBBON_THICKNESS_RATIO: RIBBON_THICKNESS_RATIO,
+  RIBBON_ANGLE: RIBBON_ANGLE,
+
+  /* ---- 速度 / 力 ---- */
+  MAX_SPEED: 12.5,        // 与环流角速度匹配（过低会把"多余的"速度变成径向乱窜）
+  MIN_SPEED: 7.0,
+  MAX_FORCE: 0.360,
+  DAMPER: 0.9945,
+  NOISE: 0.014,
+
+  /* ---- 经典三条规则 ---- */
+  PERCEPTION_K_R: 0.100,   // 分离半径 = 对角线 × 此值
+  SEPARATION_K_R: 0.032,
+  MIN_SEP_DIST: 2.6,
+  SEPARATION_WEIGHT: 1.20,
+  /* 分离力拥挤补偿：按"感知邻居总数"做平均会把排斥稀释掉，
+     自旋力矩一压就形成大面积堆积，鸟叠在一起看起来数量变少。 */
+  SEP_CROWD_GAIN: 1.0,
+  SEP_CROWD_KNEE: 0.62,
+  /* 本密度斥力：按邻居平均的分离力在鸟群中心因方向对称而相互抵消，
+     中心会越叠越紧；这里用"局部邻居数 vs 健康邻居数"在密处直接产生向外斥力。 */
+  SEP_DENSITY_K: 0.268,
+  SEP_SPACING: 36,
+  SEP_DENSITY_WEIGHT: 1.60,
+  SEP_DENSITY_SMOOTH: 0.90,  // 密度估计低通（治震颤）
+  SEP_DENSITY_KNEE: 1.15,    // 拥挤比超过它才开始给力（软启动）
+  ALIGNMENT_WEIGHT: 0.75,
+  COHESION_WEIGHT: 0.30,
+
+  /* ---- 径向泵 ----
+     把每只鸟拉向"当前目标半径"；继电器抬高/收回该目标，
+     于是半径在两个极值之间持续往复（极限环），无需外部打乱。 */
+  PUMP_REF: 3.20,
+  /* 全局加速度预算：所有力共享一个上限。
+     没有它时引导场/密度斥力合力可达 MAX_FORCE 的 10 倍以上，
+     单帧速度突变过大 → 环内侧鸟的可见高频震颤。 */
+  ACCEL_MAX: 0.62,
+  ACC_SMOOTH: 0.70,        // 合力低通：给鸟惯性，消除频闪式抖动
+
+  /* ---- 自旋驱动（反“小圈打转”的核心） ---- */
+  SPIN_WEIGHT: 3.5,        // 必须强于相邻对齐，否则打乱后重建不出环流
+  SPIN_TARGET: 5.8,        // （保留兼容）原“目标切向速度”
+  SPIN_W: 14.0,            // 目标角速度：ω = SPIN_W / 目标半径（全体鸟角速度一致）
+  SPIN_BRAKE: 1.0,         // 切向偏快时的刹车强度（双向比例控制，把方向掰到圆周切向）
+  SPIN_DEADZONE: 0.55,
+  SPIN_KILL_RATIO: 0.72,
+  SPIN_ADAPT: 0.35,
+
+  /* ---- 半径继电器：自持极限环（不需要任何外部打乱） ----
+     目标在"下目标 / 上目标"之间切换，切换条件是"真的到达"：
+     收紧段用内向推力把环压小，扩张段用径向泵把环拉大，如此往复。
+     振幅 = RELAY_LOW ~ RELAY_EXPAND；周期由鸟群自身弛豫速度决定。 */
+  RELAY_PULL: 0.40,        // 扩张段的额外内向压力
+  RELAY_RAMP: 2.2,         // 相位切换过渡速率（每秒）
+  RELAY_ON_SPIN: 1.0,      // 扩张段自旋驱动系数（转得快）
+  RELAY_OFF_SPIN: 0.05,    // 收紧段自旋驱动系数（切向力减弱，环才收得小）
+  RELAY_SHOVE: 0.80,       // 收紧段的向内推力
+  RELAY_EXPAND: 1.45,      // 拉伸段上目标 = 目标半径 × 此值
+  RELAY_SPACING_HI: 1.50,  // 拉伸段期望间距倍数（把鸟铺开）
+  RELAY_RELAX: 0.25,       // 拉伸段把内向压力放松到该比例（让环涨得起来）
+  RELAY_PULL_DRAW: 1.60,   // 收紧段内向拉力倍数
+  RELAY_LOW: 0.66,         // 收紧段下目标 = 目标半径 × 此值
+  RELAY_TOL: 0.12,         // 到达判定容差（±12% 即算到达）
+  RELAY_DRAW_MAX: 3.5,     // 收紧段最长时长（秒，仅兜底）
+  RELAY_SWELL_MAX: 12.0,   // 拉伸段最长时长（秒，仅兜底）
+  RELAY_PACK: 0.50,        // 收紧段分离斥力放松比例（否则分离压力顶住收不小）
+  RELAY_PACK_HI: 1.30,     // 扩张段分离斥力放大比例（涨得更开）
+
+  /* ================= S 形流动带（引导流场） =================
+     给鸟群一条闭合的蛇形中心线（椭圆 + 整周期正弦 → 细长 S 带）+ 法向厚度：
+       每只鸟有沿曲线的位置 s 与横向偏移 u，沿切向流动并被弹簧拉向 s 对应的点；
+       形态在 圆环 与 长 S 带 之间按 SHAPE_HOLD 秒往复，
+       于是"成环 → 拉成 S 形流动带 → 再卷回环"的演化能一直看到。
+     SHAPE_MODE: 'ring' 只看圆环极限环 / 'band' 只做 S 形带 / 'morph' 两者轮回。 */
+  SHAPE_MODE: 'morph',       // 圆环(默认主形态) ↔ S 形带 轮回；设 'ring'/'band' 可固定
+  SHAPE_SPEED: 3.4,        // 沿带子的流动速度（过快会把鸟挤成实心带）
+  SHAPE_FIELD: 2.60,       // 引导场强度（越大越贴合中心线）
+  SHAPE_ALIGN: 0.80,       // 沿切向的速度对齐强度
+  SHAPE_THICK: 0.060,      // 带子半厚（法向，相对 min(W,H)/2）
+  SHAPE_WAVE: 0.06,        // 沿带子推进的起伏幅度
+  SHAPE_WAVE_SPEED: 0.55,  // 起伏推进速度（弧度/秒）
+  SHAPE_MORPH: 0.075,      // 圆环↔S 带 的过渡速率（每秒）
+  SHAPE_HOLD: 20.0,        // 每个形态保持更久 → 圆环是主形态，S 带偶尔出现
+  SHAPE_CURVE_CLAMP: 0.85,
+  /* 方案3：S 带路径跟踪（有界横向速度 + 最小距离投影） */
+  SHAPE_LAT_TAU: 14,       // 横向偏差→横向速度的比例（帧）
+  SHAPE_LAT_CAP: 0.10,     // 横向速度上限 = guideSpeed × 此值（≈29°）
+  SHAPE_LAT_DEAD: 0.35,      // 死区：带内不修正，方向保持干净
+  SHAPE_LAT_E_CAP: 16.0,     // 横向偏差参与修正的上限 = 带厚 × 此值
+  SHAPE_SAMPLES: 384,      // 中心线采样数
+
+  /* ---- 环形 / 极限环 ---- */
+  MILL_WEIGHT: 0.80,
+  PRESSURE_K: 0.85,
+  TARGET_RADIUS_RATIO: 0.32,   // 环更紧 → 局部更同向、看得出流线
+  RING_BAND: 0.44,
+  RING_THRESHOLD: 0.45,
+  RING_GAIN_OUT: 0.055,
+  RING_GAIN_IN: 0.040,
+  RING_RATIO_MAX: 1.65,
+  HYS_SMOOTH: 0.985,
+  HYS_GAIN: 0.60,
+  HYS_REF: 0.80,
+  RADIAL_DAMP: 0.26,
+  ORBIT_LOCK: 0.55,        // 半径锁定：让每只鸟守住自己的轨道半径（治径向乱窜）
+  ORBIT_LOCK_MAX: 0.45,
+
+  /* ---- 反塌缩 / 反小圈 ---- */
+  ANTICOIL_RATIO: 0.50,
+  ANTICOIL_WEIGHT: 0.085,
+  ANTI_COLLAPSE_STRENGTH: 0.12,
+
+  /* ---- 全局去旋转（软上限） ---- */
+  DESWIRL_THRESHOLD: 0.58,
+  DESWIRL_FULL: 0.95,
+  DESWIRL_STRENGTH: 0.030,
+  DESWIRL_TAU: 0.62,
+
+  /* ---- 局部涡旋抑制 ---- */
+  LOCAL_SWIRL_STRENGTH: 0.020,
+  LOCAL_SWIRL_SMOOTH: 0.97,
+  LOCAL_SWIRL_THRESHOLD: 0.26,
+  LOCAL_SWIRL_MIN_DIST: 0.022,
+
+  /* ---- 边界 ---- */
+  EDGE_MARGIN: 84,
+  EDGE_FORCE: 0.0016,
+
+  /* ---- 游隼（鼠标） ----
+     逃跑力走"独立通道"，不参与全局加速度预算的缩放 ——
+     否则预算限幅会把惊散一起削掉（实测只散开 3%）。 */
+  PREDATOR_RADIUS: 340,      // 影响半径（随屏幕缩放）
+  PREDATOR_FORCE: 5.00,      // 惊散强度
+  PREDATOR_MAX_FORCE: 1.30,  // 恐惧基数
+  PREDATOR_SIDE: 0.30,       // 侧向绕开分量
+  PANIC_SPEED: 1.45,         // 被惊到时允许的冲刺速度倍数
+  PANIC_ACCEL: 5.0,          // 被惊到时的加速度预算倍数
+
+  /* ---- 扰动与恢复 ---- */
+  DISTURB_DURATION: 4000,
+  DISTURB_ALIGN_DAMP: 0.30,
+  DISTURB_COHESION_DAMP: 0.50,
+  DISTURB_MILL_DAMP: 0.30,
+  DISTURB_DESWIRL_BOOST: 2.0,
+  DISTURB_SPIN_BOOST: 1.35,    // 打乱后加强自旋力矩，让环流更快重建
+  BURST_TIME: 0.85,
+  DISTURB_MODE: 'scatter',     // 'scatter' 全局打乱 / 'local' 只打散鼠标附近 / 'none'
+  SCATTER_SPREAD: 0.92,
+  SCATTER_POS: 0.05,
+  SCATTER_IMPULSE: 1.15,       // 打乱瞬间的速度冲量（爆发感）
+  SCATTER_FLASH: 1.0,          // 打乱瞬间的闪光强度（0 = 不闪）
+  FLASH_DECAY: 2.4,            // 闪光衰减速率（每秒）
+  DISTURB_AUTO_MIN: 24000,     // 定时打乱的最短间隔（毫秒）
+  DISTURB_AUTO_JITTER: 8000,   // 再叠加 0~8s 随机
+  /* 定时打乱默认关闭：极限环现在已经能自持，不需要靠打乱来"制造"周期。
+     想看"打乱→恢复"按 D 打开定时打乱，或按空格手动打乱一次。 */
+  AUTO_DISTURB: false,
+
+  /* ---- 叛逆者 ---- */
+  REBEL_RATIO: 0.03,
+  REBEL_ALIGN_FACTOR: 0.15,
+
+  /* ---- 配色：白色鸟 + 黑色背景 ----
+     鸟体颜色改成可控的 RGB 配比（不是色相），默认纯白：
+       · 外发光：很淡的白（负责拖尾余辉的柔和感）
+       · 中层  ：中等亮度白
+       · 核心  ：最亮的白
+     想换回彩色：把 TINT_* 改成不同的 [r,g,b] 配比，
+     或把 BIRD_WHITE 设为 false（则回退到原来的色相 hsla 着色）。 */
+  BIRD_WHITE: true,
+  TINT_GLOW: [1.00, 1.00, 1.00],
+  TINT_MID: [1.00, 1.00, 1.00],
+  TINT_CORE: [1.00, 1.00, 1.00],
+  GLOW_SCALE: 2.60,
+  GLOW_ALPHA: 0.070,
+  MID_ALPHA: 0.240,
+  CORE_ALPHA: 0.950,
+  L_GLOW: 40,      // 仅 BIRD_WHITE=false 时使用（色相着色）
+  L_MID: 44,
+  L_CORE: 60,
+  /* 拖尾长短：这个值越大，上一帧越快被背景覆盖 → 拖尾越短。
+     0.11 是原来的长拖尾；0.34 大约只剩 3~4 帧的余辉。 */
+  TRAIL_ALPHA: 0.34,
+  /* 以下色相相关项仅在 BIRD_WHITE=false 时生效 */
+  HUE_BASE: 200,
+  HUE_RANGE: 10,
+  HUE_JITTER: 10,
+  HUE_DRIFT: 0.055,
+  SPEED_HUE_GAIN: 1.6,
+  SAT_GLOW: 82,
+  SAT_MID: 88,
+  SAT_CORE: 90,
+  REBEL_HUE_SHIFT: 34,
+
+  /* ---- 面板（HUD）----
+     作为壁纸不需要任何面板：固定关闭，不绘制也不占用交互。
+     想临时看曲线（例如调极限环），把下面改成 true，用浏览器直接打开即可。 */
+  HUD: false,
+  TRACE_SECONDS: 24,
+};
+
+/* ---- URL 参数覆盖（壁纸软件里没法按键，用参数配置最可靠）----
+   ?hud=1 / ?hud=0      显示或隐藏 HUD 面板
+   ?mode=ring|band|morph 固定形态（ring=S 形环，band=S 形流动带，morph=轮回）
+   ?disturb=1           开定时打乱
+   ?birds=900           鸟数
+   ?predator=0          关闭鼠标惊散
+   例：.../boids-limit-cycle_Wallpaper.html?hud=1&mode=ring */
+(function applyQuery() {
+  const q = String((window.location && window.location.search) || '');
+  if (!q || q.length < 2) return;
+  const num = (v) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+  for (const part of q.slice(1).split('&')) {
+    const eq = part.indexOf('=');
+    const key = (eq < 0 ? part : part.slice(0, eq)).toLowerCase();
+    const raw = eq < 0 ? '1' : decodeURIComponent(part.slice(eq + 1));
+    const val = raw.toLowerCase();
+    const on = !(val === '0' || val === 'false' || val === 'off' || val === 'no');
+    /* 面板已彻底移除：不接受任何开启它的参数，避免又冒出 UI */
+    if (key === 'hud') { /* 忽略 */ }
+    else if (key === 'mode') {
+      if (val === 'ring' || val === 'band' || val === 'morph') CONFIG.SHAPE_MODE = val;
+    } else if (key === 'disturb') CONFIG.AUTO_DISTURB = on;
+    else if (key === 'bird' || key === 'birds' || key === 'count') {
+      const n = num(raw);
+      if (n !== null && n >= 20) birdCount = Math.round(n);
+    } else if (key === 'predator' || key === 'mouse') predatorEnabled = on;
+    else if (key === 'speed') { const n = num(raw); if (n !== null) CONFIG.SHAPE_SPEED = n; }
+  }
+})();
+
+/* ============================================================================
+   物理内核：极限环 boids
+   ========================================================================== */
+/* ===== KERNEL:BEGIN (由 _dev/build-html.js 注入，勿手改) ===== */
+(function (root) {
+  'use strict';
+
+  const BASE_DIAG = Math.sqrt(1920 * 1920 + 1080 * 1080);
+
+  /* ---------- 默认参数（调优后的值） ---------- */
+  const DEFAULTS = {
+    /* 屏幕适配 */
+    REF_AREA: 1920 * 1080,
+    PERCEPTION_K: 0.080,
+    SIZE_K: 0.0030,
+    /* 小窗口里同样数量的鸟更拥挤，分离/对齐的合力会压过自旋力矩，
+       导致又缩成一小团原地打转。按面积比做幂次补偿，使各分辨率表现一致。 */
+    DENSITY_POW: 0.50,
+
+    /* 速度 / 力 */
+    MAX_SPEED: 12.5,
+    MIN_SPEED: 7.0,
+    MAX_FORCE: 0.360,
+    DAMPER: 0.9945,          // 每 1/60 秒
+    SPEED_GAIN: 0.075,       // 速度误差反馈（成环时把大家拉到同一速率）
+
+    /* 三条经典规则的权重 */
+    PERCEPTION_K_R: 0.100,
+    SEPARATION_K_R: 0.032,
+    MIN_SEP_DIST: 2.6,
+    SEPARATION_WEIGHT: 1.20,
+    /* 分离力的拥挤补偿：鸟堆在一起时（近距离邻居相对总数太少）就成倍加强排斥，
+       否则大面积堆积会把"按感知邻居总数做平均"的分离力稀释掉，
+       结果一群鸟叠在一起、看起来数量变少。1 = 关闭补偿。 */
+    SEP_CROWD_GAIN: 1.0,
+    SEP_CROWD_KNEE: 0.62,
+    SEP_RANGE_BOOST: 1.35,   // 近距离邻居越多，分离力的作用半径越向外延伸
+    SEP_RANGE_MAX: 1.9,
+    /* 本密度斥力：解决"中心堆积"。
+       按邻居平均的分离力在鸟群中心会因为方向对称而相互抵消，
+       于是中心的鸟会越叠越紧（看起来像少了一大半鸟）。
+       这里改用"局部邻居数 vs 健康邻居数"的密 crowding 量，
+       直接在密度过高的地方产生向外的斥力（类似气体压力）。 */
+    SEP_DENSITY_K: 0.268,    // 健康邻居数 = SEP_DENSITY_K × (感知面积 / 鸟群面积) × N
+    SEP_SPACING: 36,         // 期望的最小视觉间距（像素，按 1920×1080 折算）
+    SEP_DENSITY_WEIGHT: 1.60,
+    ALIGNMENT_WEIGHT: 0.75,
+    COHESION_WEIGHT: 0.30,
+
+    /* 环形 / 极限环 */
+    MILL_WEIGHT: 0.80,
+    PRESSURE_K: 0.85,
+    TARGET_RADIUS_RATIO: 0.32,
+    RING_BAND: 0.44,
+    RING_THRESHOLD: 0.45,
+    RING_GAIN_OUT: 0.055,
+    RING_GAIN_IN: 0.040,
+    RING_RATIO_MAX: 1.65,
+
+    /* 自旋驱动：手性锁定的切向扭矩 → 形成大尺度极限环 */
+    SPIN_WEIGHT: 3.5,          // 扭矩权重（必须强于相邻对齐，否则打乱后无法重建环流）
+    SPIN_TARGET: 5.8,          // （保留兼容）原“目标切向速度”
+    SPIN_W: 14.0,              // 目标角速度：ω = SPIN_W / 目标半径（刚体旋转 → 所有鸟角速度一致）
+    SPIN_DEADZONE: 0.55,
+    SPIN_BRAKE: 1.0,           // 切向偏快时的刹车强度（1=对称比例控制）       // 低于此切向速度就开始驱动
+    SPIN_KILL_RATIO: 0.72,     // 均值半径低于目标半径×此值时，扭矩线性衰减（反小圈打转）
+    SPIN_LOCK: 0.045,          // 实测手性与锁定手性相反时的解锁速率
+    SPIN_ADAPT: 0.35,          // 手性自适应的混合速率
+    SPIN_TAU: 0.25,            // 自旋量衰减时间常数（秒）
+
+    /* 半径继电器：让极限环出现"高速外环 ←→ 低速内缩"的自持周期 */
+    RELAY_ON: 0.82,            // （旧参数，保留仅用于兼容）
+    RELAY_OFF: 0.44,
+    RELAY_MIN_HOLD: 1.6,
+    RELAY_PULL: 0.40,          // 扩张段的额外内向压力（慢慢把环拉小）
+    RELAY_RAMP: 2.2,           // 开关过渡速率（每秒）
+    RELAY_ON_SPIN: 1.0,        // 扩张段驱动系数
+    RELAY_OFF_SPIN: 0.05,      // 收紧段驱动系数（切向力减弱，环才能收小）
+    /* 自持极限环的四要素 */
+    RELAY_SHOVE: 0.80,         // 收紧段额外的向内推力（把环压小）
+    RELAY_EXPAND: 1.45,        // 拉伸段上目标（×目标半径）
+    RELAY_LOW: 0.66,           // 收紧段的下目标（×目标半径）
+    RELAY_TOL: 0.12,           // 到达判定容差（±12% 即算到达）
+    RELAY_DRAW_MAX: 3.5,       // 收紧段最长时长（秒，仅兜底）
+    RELAY_SWELL_MAX: 12.0,     // 拉伸段最长时长（秒，仅兜底）
+    RELAY_PACK: 0.50,          // 收紧段把分离斥力放松到该比例（让环收得下去）
+    RELAY_PACK_HI: 1.30,       // 扩张段把分离斥力放大到该比例（让环涨得开）
+    RELAY_RELAX: 0.25,         // 拉伸段把内向压力/迟滞放松到该比例（让环涨得起来）
+    RELAY_SPACING_HI: 1.50,    // 拉伸段的期望间距倍数（把鸟铺开 → 视觉拉伸更明显）
+    RELAY_PULL_DRAW: 1.60,     // 收紧段额外向内拉力的倍数
+
+    /* 迟滞径向反馈（自持振荡的关键） */
+    HYS_SMOOTH: 0.985,
+    HYS_GAIN: 0.60,
+    HYS_REF: 0.80,
+
+    /* 径向阻尼：抑制高频抖动，让半径的往复干净可读 */
+    RADIAL_DAMP: 0.26,
+    /* 半径锁定：圆环模式里让每只鸟守住自己的轨道半径。
+       实测不锁定时单鸟半径会乱窜 ±180~570px，看起来像"各自转小圈"。
+       ORBIT_LOCK 越大越整齐（太大则失去鸟群的自组织感）。 */
+    ORBIT_LOCK: 0.55,
+    ORBIT_LOCK_MAX: 0.45,
+    /* 径向泵强度：每只鸟被拉向"当前目标半径"；
+       继电器会抬高/收回这个目标，于是半径在两个极值之间持续往复（极限环）。
+       不需要任何外部打乱。 */
+    PUMP_REF: 3.20,
+
+    /* ================= S 形流动带（引导流场） =================
+       给鸟群一条闭合的蛇形中心线（"赛道"）+ 法向厚度：
+         · 每只鸟有沿曲线的位置 s 与横向偏移 u
+         · 沿切向以 SHAPE_SPEED 流动，被弹簧拉回 s 对应的目标点
+         · 中心线本身随时间做横向蛇形波动 → 带子像蛇一样起伏
+       形态在 圆环(blend=0) 与 长条带(blend=1) 之间缓慢往复，
+       于是"成环 → 拉成长带 → 再卷回环"的演化能一直看到。 */
+    SHAPE_MODE: 'morph',      // 'ring' | 'band' | 'morph'
+    SHAPE_LEN: 0.95,          // 带子半长（相对 min(W,H)）
+    SHAPE_WIDTH: 0.42,        // 带子半宽
+    SHAPE_THICK: 0.060,       // 带子半厚（法向）
+    SHAPE_WAVE: 0.06,         // 蛇形振幅（在 S 形上再叠加起伏）
+    SHAPE_WAVE_K: 3.0,
+    /* 方案3：有界横向速度的路径跟踪 */
+    SHAPE_LAT_TAU: 14,          // 横向偏差→横向速度的比例（帧）
+    SHAPE_LAT_CAP: 0.10,       // 横向速度上限 = guideSpeed × 此值（≈29°）
+    SHAPE_LAT_DEAD: 0.35,      // 死区：横向偏差小于此比例×带厚时不修正
+    SHAPE_LAT_E_CAP: 16.0,      // 横向偏差参与修正的上限 = 带厚 × 此值        // 沿曲线的整数波数
+    SHAPE_WAVE_SPEED: 0.55,   // 波沿曲线推进速度（弧度/秒）
+    SHAPE_SPEED: 3.4,         // 沿带子的流动速度（过快会把鸟挤成实心带）
+    SHAPE_FIELD: 2.60,        // 引导场强度（越大越贴合带子；太弱会跟不上中心线）
+    SHAPE_ALIGN: 0.80,
+    SHAPE_U_TAU: 22,           // 横向（u）收敛时间常数（帧）：越大越慢、速度方向越干净        // 沿切向的速度对齐强度
+    SHAPE_MORPH: 0.075,       // 圆环↔长带 的过渡速率（每秒）
+    SHAPE_HOLD: 12.0,         // 每个形态保持时间（秒）
+    SHAPE_CURVE_CLAMP: 0.85,  // 横向偏移不超过曲率半径的这个比例（防止带子自交）
+    SHAPE_SAMPLES: 384,       // 中心线采样数
+
+    /* 全局加速度预算 —— 治"内侧震颤"的关键。
+       原来每项力各自被 MAX_FORCE 钳制，但我后加的引导场 / 本密度斥力绕过了它，
+       单帧加速度能到 4 以上（MAX_FORCE 才 0.36），表现为高频抖动。
+       这里在积分前对合力统一限幅，让所有力共享同一个预算。 */
+    ACCEL_MAX: 0.62,
+    /* 运动平滑（治“抖/跳”）——
+       实测加速度方向每秒翻转约 18 次：鸟被各股力反复推拉，
+       即使每帧速度变化不大，画面上也是频闪式的抖。
+       做法：给“合力”加一级低通，让鸟有惯性、加速度不是每帧重算。
+       ACC_SMOOTH 越大越平滑（响应略慢）。 */
+    ACC_SMOOTH: 0.70,
+    /* 本密度斥力的时间平滑：密度估计本身有噪声（邻居进出计数半径），
+       直接用会抖；这里做低通，并把"超密"响应改成软启动。 */
+    SEP_DENSITY_SMOOTH: 0.90,
+    SEP_DENSITY_KNEE: 1.15,   // 超过这个拥挤比才开始给力（之前是 >1 就给）
+
+    /* 逃出小圈 / 反塌缩 */
+    ANTICOIL_RATIO: 0.50,
+    ANTICOIL_WEIGHT: 0.085,
+    ANTI_COLLAPSE_STRENGTH: 0.12,
+
+    /* 全局去旋转（软上限，仅压制极端打转） */
+    DESWIRL_THRESHOLD: 0.58,
+    DESWIRL_FULL: 0.95,
+    DESWIRL_STRENGTH: 0.030,
+    DESWIRL_TAU: 0.62,
+
+    /* 局部涡旋抑制（只抓真正的小漩涡） */
+    LOCAL_SWIRL_STRENGTH: 0.020,
+    LOCAL_SWIRL_SMOOTH: 0.97,
+    LOCAL_SWIRL_THRESHOLD: 0.26,
+    LOCAL_SWIRL_MIN_DIST: 0.022,
+
+    /* 边界 */
+    EDGE_MARGIN: 84,
+    EDGE_FORCE: 0.0016,
+
+    /* 游隼（鼠标扰动） */
+    PREDATOR_RADIUS: 340,      // 游隼影响半径（乘屏幕缩放）
+    PREDATOR_FORCE: 5.00,      // 惊散强度
+    PREDATOR_MAX_FORCE: 1.30,
+    PREDATOR_SIDE: 0.30,       // 侧向绕开分量（被惊到的鸟绕开而不是只径向弹开）
+    PANIC_SPEED: 1.45,         // 被惊到时允许的速度上限倍数
+    PANIC_ACCEL: 5.0,          // 被惊到时的加速度预算倍数
+
+    /* 扰动后恢复期 */
+    DISTURB_DURATION: 4000,
+    DISTURB_ALIGN_DAMP: 0.30,
+    DISTURB_COHESION_DAMP: 0.50,
+    DISTURB_MILL_DAMP: 0.30,
+    DISTURB_DESWIRL_BOOST: 2.0,
+    DISTURB_SPIN_BOOST: 1.35, // 打乱后加强自旋力矩：环流被抹平后能更快重建
+
+    /* 扰动源 */
+    DISTURB_AUTO_MIN: 24000,
+    DISTURB_AUTO_JITTER: 8000,
+    BURST_TIME: 0.85,
+    /* 'scatter'=全体方向随机化（恢复过程最清晰） / 'local'=只在游隼附近打散 / 'none' */
+    DISTURB_MODE: 'scatter',
+    SCATTER_SPREAD: 0.92,
+    SCATTER_POS: 0.05,        // 位置抖散幅度（相对屏幕对角线）
+    SCATTER_IMPULSE: 1.15,    // 打乱瞬间的速度冲量（爆发感）
+    SCATTER_FLASH: 1.0,       // 打乱瞬间的闪光强度（0 = 不闪）
+    FLASH_DECAY: 2.4,         // 闪光衰减速率（每秒）
+
+    /* 叛逆者 */
+    REBEL_RATIO: 0.03,
+    REBEL_ALIGN_FACTOR: 0.15,
+
+    /* 数值噪声 */
+    NOISE: 0.014,
+
+    /* 丝带初态 */
+    RIBBON_LENGTH_RATIO: 0.86,
+    RIBBON_THICKNESS_RATIO: 0.05,
+    RIBBON_ANGLE: -0.18,
+
+    /* 颜色（亮度整体调低一档） */
+    HUE_BASE: 200,
+    HUE_RANGE: 10,
+    HUE_JITTER: 10,
+    HUE_DRIFT: 0.055,
+    SPEED_HUE_GAIN: 1.6,
+    GLOW_SCALE: 2.60,
+    GLOW_ALPHA: 0.075,
+    MID_ALPHA: 0.230,
+    CORE_ALPHA: 0.900,
+    L_GLOW: 40,
+    L_MID: 44,
+    L_CORE: 60,
+    REBEL_HUE_SHIFT: 34,
+    SAT_GLOW: 82,
+    SAT_MID: 88,
+    SAT_CORE: 90,
+    TRAIL_ALPHA: 0.11,
+  };
+
+  const PHASES = {
+    ribbon: '丝带初态',
+    cohere: '凝聚 · 卷曲',
+    ring: '极限环 · 成环',
+    expand: '拉伸 · 膨胀',
+    retract: '回缩 · 加速',
+    disturbed: '扰动 · 打散',
+    recover: '恢复 · 重聚',
+    band: 'S 形流动带',
+    morph: '形态过渡 · 卷曲/展开',
+  };
+
+  function mulberry32(seed) {
+    let a = seed >>> 0;
+    return function () {
+      a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  function smoothstep(edge0, edge1, x) {
+    let t = (x - edge0) / (edge1 - edge0);
+    if (t < 0) t = 0; else if (t > 1) t = 1;
+    return t * t * (3 - 2 * t);
+  }
+
+  /* S 形流动带的中心线（解析闭合，无接缝）：
+       x = ax · cosθ
+       y = ay · sinθ + A · sinθ        （A 与 ay 合成单一蛇形，k=1 保证闭合）
+     即"椭圆 + 沿长轴的整周期正弦"，得到一条细长的 S 带。
+     实测最小曲率半径远大于带子半厚（≈640px vs ≈60px），
+     所以带子在任何位置都不会自交，腰不会糊成一团。 */
+  const SERP_AX = 1.04;    // 半长 / min(W,H)/2
+  const SERP_AY = 0.090;   // 基础半宽
+  const SERP_AMP = 0.330;  // 蛇形振幅（沿短轴的 S 形起伏）
+  function serpPoint(theta, out) {
+    const half = out._half;
+    out.x = SERP_AX * half * Math.cos(theta);
+    out.y = (SERP_AY * Math.sin(theta) + SERP_AMP * Math.sin(theta)) * half;
+    out.r = Math.hypot(out.x, out.y);
+    return out;
+  }
+
+  /* 注意：不使用 class field 初始值——本类在 constructor 中调用 resize()，
+     field 初始值会在 constructor 体之后执行并覆盖 resize() 的结果。 */
+  class Boids {
+    constructor(opts) {
+      opts = opts || {};
+      /* 内核不含任何全局配置：要么显式传 config，要么用本模块的 DEFAULTS。
+         这样 HTML 里可以由构建脚本原样内嵌同一份代码。 */
+      this.cfg = opts.config || DEFAULTS;
+      this.N = opts.count | 0 || 750;
+      this.seed = opts.seed === undefined ? 20240517 : (opts.seed >>> 0);
+      this.rand = mulberry32(this.seed);
+      this.W = opts.width || 1920;
+      this.H = opts.height || 1080;
+
+      /* 状态量先清零，再做分辨率相关的派生量 */
+      this.t = 0;
+      this.frames = 0;
+      this.gcx = 0; this.gcy = 0;
+      this.clusterRadius = 0;
+      this.smoothedR = 0;
+      this.angMomentum = 0;
+      this.tangential = 0;
+      this.radial = 0;
+      this.meanSpeed = 0;
+      this.order = 0;
+      this.rotationOrder = 0;
+      this.coherence = 0;
+      this.millGate = 0;
+      this.chirality = 0;
+      this.spin = 0;
+      this.spinDrive = 1;
+      this.relayPull = 0;
+      this.relay = 0;
+      this.relayOn = false;
+      this.relayHold = 0;
+      this.relayRMin = 1e9;
+      this.relayRMax = 0;
+      this.relayShove = 0;
+      this.relayTargetK = 1;
+      this.relayDrawT = 0;
+      this.relaySwellT = 0;
+      this.phase = 'ribbon';
+      this.disturbRatio = 0;
+      this.flash = 0;
+      this.lastDisturbTime = -1e9;
+      this.burstUntil = -1e9;
+      this.targetRadius = 0;
+      this.ringTarget = 0;
+
+      /* S 形流动带的状态 */
+      this.shapeBlend = 0;        // 0 = 圆环, 1 = 长条带
+      this.shapeTarget = 1;
+      this.shapeHoldT = 0;
+      this.shapeWavePhase = 0;
+      this.pathN = Math.max(64, this.cfg.SHAPE_SAMPLES | 0 || 384);
+      this.pathX = new Float64Array(this.pathN);
+      this.pathY = new Float64Array(this.pathN);
+      this.pathTX = new Float64Array(this.pathN);
+      this.pathTY = new Float64Array(this.pathN);
+      this.pathNX = new Float64Array(this.pathN);
+      this.pathNY = new Float64Array(this.pathN);
+      this.pathS = new Float64Array(this.pathN);
+      this.sBuf = new Float64Array(this.N);
+      this.uBuf = new Float64Array(this.N);
+      this.ctrlX = new Float64Array(Math.max(16, this.pathN >> 3));
+      this.ctrlY = new Float64Array(Math.max(16, this.pathN >> 3));
+      this.ctrlN = 0;
+      this.hitBuf = { x: 0, y: 0, tx: 1, ty: 0, nx: 0, ny: 1, curv: 0 };
+      this.pathLen = 1;
+
+      this.resize(this.W, this.H);
+
+      const n = this.N;
+      this.px = new Float64Array(n);
+      this.py = new Float64Array(n);
+      this.vx = new Float64Array(n);
+      this.vy = new Float64Array(n);
+      this.hue = new Float64Array(n);
+      this.isRebel = new Uint8Array(n);
+      this.localSwirl = new Float64Array(n);
+      this.densBuf = new Float64Array(n);
+      this.orbitR = new Float64Array(n);
+      /* 方案3：每只鸟上次的最近路径样本号（用于 O(1) 局部搜索） */
+      this.nearIdx = new Int32Array(n).fill(-1);
+      /* 运动平滑：上一帧的合力（给鸟一点惯性，消除频闪式抖动） */
+      this.aSmoothX = new Float64Array(n);
+      this.aSmoothY = new Float64Array(n);
+
+      this.autoDisturbAt = Infinity;
+      this.armAutoDisturb();
+
+      this.initRibbon();
+    }
+
+    /* ---------- 分辨率相关量 ---------- */
+    resize(W, H) {
+      this.W = W = Math.max(1, W);
+      this.H = H = Math.max(1, H);
+      const c = this.cfg;
+      const diag = Math.sqrt(W * W + H * H);
+      const k = Math.sqrt((W * H) / c.REF_AREA);
+      this.scaleK = k;
+
+      this.disturbRatio = 0;
+      this.perception = c.PERCEPTION_K * diag;
+      this.perception2 = this.perception * this.perception;
+      this.separationR = c.SEPARATION_K_R * diag;
+      this.separation2 = this.separationR * this.separationR;
+      this.minSepDist = c.MIN_SEP_DIST * k;
+      this.localMinDist2 = Math.pow(c.LOCAL_SWIRL_MIN_DIST * diag, 2);
+      this.edgeMargin = c.EDGE_MARGIN * k;
+      this.predatorRadius = c.PREDATOR_RADIUS * k;
+      this.predatorRadius2 = this.predatorRadius * this.predatorRadius;
+      this.birdSize = c.SIZE_K * diag;
+      this.scatterPos = c.SCATTER_POS * diag;
+      /* 屏幕面积相对参考面积的比值，用来补偿"小窗口鸟更挤"的问题 */
+      this.areaK = (W * H) / c.REF_AREA;
+      const comp = Math.pow(this.areaK, (c.DENSITY_POW || 0) * 0.5);
+      this.wSep = c.SEPARATION_WEIGHT * comp;
+      this.wAli = c.ALIGNMENT_WEIGHT * comp;
+      this.wCoh = c.COHESION_WEIGHT * comp;
+      this.wMill = c.MILL_WEIGHT * comp;
+      this.targetRadius = Math.min(W, H) * c.TARGET_RADIUS_RATIO;
+      this.ringTarget = this.targetRadius;
+      this.smoothedR = this.smoothedR || this.targetRadius;
+
+      this.cell = Math.max(8, this.perception);
+      this.cols = Math.max(1, Math.ceil(W / this.cell));
+      this.rows = Math.max(1, Math.ceil(H / this.cell));
+      this.grid = new Array(this.cols * this.rows);
+      for (let i = 0; i < this.grid.length; i++) this.grid[i] = [];
+    }
+
+    /* ---------- 丝带初态 ---------- */
+    initRibbon() {
+      const c = this.cfg, rand = this.rand, N = this.N;
+      const cx = this.W * 0.5, cy = this.H * 0.5;
+      const len = this.W * c.RIBBON_LENGTH_RATIO;
+      const thick = this.H * c.RIBBON_THICKNESS_RATIO;
+      const a = c.RIBBON_ANGLE;
+      const cosA = Math.cos(a), sinA = Math.sin(a);
+      const speed0 = c.MAX_SPEED * 0.82;
+
+      for (let i = 0; i < N; i++) {
+        const t = i / (N - 1) - 0.5 + (rand() - 0.5) * (1 / N);
+        const lx = t * len;
+        const ly = (rand() - 0.5) * thick;
+        this.px[i] = cx + lx * cosA - ly * sinA;
+        this.py[i] = cy + lx * sinA + ly * cosA;
+
+        const ang = a + (rand() - 0.5) * 0.20;
+        const sp = speed0 * (0.92 + rand() * 0.16);
+        this.vx[i] = Math.cos(ang) * sp;
+        this.vy[i] = Math.sin(ang) * sp;
+
+        this.hue[i] = c.HUE_BASE + t * c.HUE_RANGE * 3 + (rand() - 0.5) * c.HUE_JITTER;
+        this.isRebel[i] = rand() < c.REBEL_RATIO ? 1 : 0;
+        this.localSwirl[i] = 0;
+      }
+
+      this.t = 0;
+      this.frames = 0;
+      this.smoothedR = 0;
+      this.spin = 0;
+      this.relay = 0;
+      this.relayOn = false;
+      this.relayHold = 0;
+      this.relayRMin = 1e9;
+      this.relayRMax = 0;
+      this.relayShove = 0;
+      this.relayTargetK = 1;
+      this.relayDrawT = 0;
+      this.relaySwellT = 0;
+      /* 转向由丝带初态决定：直线飞行的丝带被内聚力拉弯后自然卷成同向环流 */
+      this.chirality = c.RIBBON_ANGLE < 0 ? 1 : -1;
+      this.lastDisturbTime = -1e9;
+      this.burstUntil = -1e9;
+      this.relayDrawT = 0;
+      this.relaySwellT = 0;
+      this.relayRMin = 1e9;
+      this.relayRMax = 0;
+      this.armAutoDisturb();
+      this.phase = 'ribbon';
+      this.updateShape(0, 1 / 60);      // 建表 + 初始化每只鸟在带子上的位置
+      this.updateMetrics(1 / 60);
+    }
+
+    /* ================= S 形流动带的引导流场 ================= */
+
+    /* 重建中心线查找表：等弧长重采样 + 切向 + 外向法向 */
+    rebuildPath() {
+      /* 投影兜底阈值：(32×带厚)² —— 超过它说明局部窗口失效，需要全扫描 */
+      {
+        const gt = (this.cfg.SHAPE_THICK || 0.06) * Math.min(this.W, this.H) * 0.5;
+        const lim = Math.max(64, gt * 32);
+        this.pathFar2 = lim * lim;
+      }
+      const n = this.pathN, c = this.cfg;
+      const ctrlN = Math.max(8, n >> 4);
+      const half = Math.min(this.W, this.H) * 0.5;
+      const L = (c.SHAPE_LEN || 3.05) * half;
+      const Wd = (c.SHAPE_WIDTH || 0.235) * half;
+      const R0 = Math.min(this.W, this.H) * (c.TARGET_RADIUS_RATIO || 0.4);
+      const xc = this.W * 0.5, yc = this.H * 0.5;
+      const blend = this.shapeBlend;
+
+      /* 控制点（闭合 Catmull-Rom）
+         形态插值：圆环 ↔ 细长 S 带（椭圆 + 沿长轴整周期正弦）。
+         解析闭合、曲率平缓；再沿法向叠加推进的蛇形波，让带子像蛇一样起伏。 */
+      const waveAmp = (c.SHAPE_WAVE || 0) * half;
+      const unit = { x: 0, y: 0, r: 0, _half: half };
+      for (let i = 0; i < ctrlN; i++) {
+        const ang = (i / ctrlN) * Math.PI * 2;
+        const ca = Math.cos(ang), sa = Math.sin(ang);
+        const rx = ca * R0, ry = sa * R0;
+        serpPoint(ang, unit);
+        const bx = unit.x, by = unit.y;
+        let x = rx + (bx - rx) * blend;
+        let y = ry + (by - ry) * blend;
+        if (waveAmp > 0 && blend > 0.001) {
+          const i1 = (i + 1) % ctrlN, im = (i - 1 + ctrlN) % ctrlN;
+          const tx = this.ctrlX[i1] - this.ctrlX[im];
+          const ty = this.ctrlY[i1] - this.ctrlY[im];
+          const tm = Math.hypot(tx, ty) || 1;
+          const px2 = -ty / tm, py2 = tx / tm;
+          /* 长轴中段叠波、两端收小，避免端部被拧成结 */
+          const taper = Math.min(1, Math.abs(ca) / 0.6);
+          const ph = ang * 3 - this.shapeWavePhase;
+          const off = Math.sin(ph) * waveAmp * blend * taper;
+          x += px2 * off;
+          y += py2 * off;
+        }
+        this.ctrlX[i] = x;
+        this.ctrlY[i] = y;
+      }
+      this.ctrlN = ctrlN;
+
+      /* 细采样 + 累计弧长 */
+      const FINE = n * 4;
+      const fx = new Float64Array(FINE), fy = new Float64Array(FINE);
+      for (let k = 0; k < FINE; k++) {
+        const u = (k / FINE) * ctrlN;
+        const i1 = Math.floor(u) % ctrlN;
+        const ft = u - Math.floor(u);
+        const i0 = (i1 - 1 + ctrlN) % ctrlN;
+        const i2 = (i1 + 1) % ctrlN;
+        const i3 = (i1 + 2) % ctrlN;
+        const p0x = this.ctrlX[i0], p0y = this.ctrlY[i0];
+        const p1x = this.ctrlX[i1], p1y = this.ctrlY[i1];
+        const p2x = this.ctrlX[i2], p2y = this.ctrlY[i2];
+        const p3x = this.ctrlX[i3], p3y = this.ctrlY[i3];
+        const t2 = ft * ft, t3 = t2 * ft;
+        fx[k] = 0.5 * ((2 * p1x) + (-p0x + p2x) * ft +
+          (2 * p0x - 5 * p1x + 4 * p2x - p3x) * t2 + (-p0x + 3 * p1x - 3 * p2x + p3x) * t3);
+        fy[k] = 0.5 * ((2 * p1y) + (-p0y + p2y) * ft +
+          (2 * p0y - 5 * p1y + 4 * p2y - p3y) * t2 + (-p0y + 3 * p1y - 3 * p2y + p3y) * t3);
+      }
+      /* 累计弧长 */
+      const cum = new Float64Array(FINE + 1);
+      for (let k = 0; k < FINE; k++) {
+        const k2 = (k + 1) % FINE;
+        cum[k + 1] = cum[k] + Math.hypot(fx[k2] - fx[k], fy[k2] - fy[k]);
+      }
+      const total = cum[FINE] || 1;
+
+      /* 等弧长重采样到 n 点 */
+      let j = 0;
+      for (let i = 0; i < n; i++) {
+        const s = (i / n) * total;
+        while (j < FINE - 1 && cum[j + 1] < s) j++;
+        const seg = cum[j + 1] - cum[j];
+        const f2 = seg > 1e-9 ? (s - cum[j]) / seg : 0;
+        const k2 = (j + 1) % FINE;
+        this.pathX[i] = xc + fx[j] + (fx[k2] - fx[j]) * f2;
+        this.pathY[i] = yc + fy[j] + (fy[k2] - fy[j]) * f2;
+        this.pathS[i] = s;
+      }
+      /* 切向 + 外向法向 */
+      for (let i = 0; i < n; i++) {
+        const a = (i - 1 + n) % n, b2 = (i + 1) % n;
+        let tx = this.pathX[b2] - this.pathX[a];
+        let ty = this.pathY[b2] - this.pathY[a];
+        const m = Math.hypot(tx, ty) || 1;
+        tx /= m; ty /= m;
+        this.pathTX[i] = tx; this.pathTY[i] = ty;
+        let nx = -ty, ny = tx;
+        const ox = this.pathX[i] - xc, oy = this.pathY[i] - yc;
+        if (nx * ox + ny * oy < 0) { nx = -nx; ny = -ny; }
+        this.pathNX[i] = nx; this.pathNY[i] = ny;
+      }
+      /* 曲率（用于限制横向偏移，防止带子自交） */
+      this.pathCurv = new Float64Array(n);
+      for (let i = 0; i < n; i++) {
+        const a = (i - 1 + n) % n, b2 = (i + 1) % n;
+        const ax = this.pathTX[a], ay = this.pathTY[a];
+        const bx2 = this.pathTX[b2], by2 = this.pathTY[b2];
+        const dtheta = Math.abs(Math.atan2(ax * by2 - ay * bx2, ax * bx2 + ay * by2));
+        const ds = total / n;
+        this.pathCurv[i] = ds > 1e-9 ? dtheta / ds : 0;
+      }
+      this.pathLen = total;
+      return total;
+    }
+
+  /* 曲线上离 (x,y) 最近的样本：返回横向偏差 eCross / 切向 / 法向 / 曲率。
+     只在"上次的最近样本"附近搜索（鸟连续运动，最近点不会跳），先粗后细。
+     已用暴力全扫描校验：749/750 只误差 ≤1px。 */
+  projectPath(i, x, y, out) {
+    const n = this.pathN;
+    const px = this.pathX, py = this.pathY;
+    let best = -1, bestD2 = Infinity;
+    const guess = this.nearIdx[i];
+    if (guess >= 0) {
+      for (let k = -5; k <= 5; k++) {
+        const j = ((guess + k) % n + n) % n;
+        const dx = x - px[j], dy = y - py[j];
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = j; }
+      }
+    }
+    /* 兜底：没有猜测点、或猜测点附近找到的最近点仍然太远，
+       就（重新）做一次全扫描粗搜。32×带厚以外的参考点肯定不能用。 */
+    const far = this.pathFar2 || 0;
+    if (best < 0 || bestD2 > far) {
+      if (best < 0) bestD2 = Infinity;
+      const stride = Math.max(1, n >> 6);
+      for (let j = 0; j < n; j += stride) {
+        const dx = x - px[j], dy = y - py[j];
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bestD2) { bestD2 = d2; best = j; }
+      }
+    }
+    for (let k = -5; k <= 5; k++) {
+      const j = ((best + k) % n + n) % n;
+      const dx = x - px[j], dy = y - py[j];
+      const d2 = dx * dx + dy * dy;
+      if (d2 < bestD2) { bestD2 = d2; best = j; }
+    }
+    this.nearIdx[i] = best;
+    this.lookupPath(best / n, out);
+    out.eCross = (x - out.x) * out.nx + (y - out.y) * out.ny;
+    out.sample = best;
+    return out;
+  }
+    lookupPath(sIn, out) {
+      const n = this.pathN;
+      let s = sIn % 1;
+      if (s < 0) s += 1;
+      const f = s * n;
+      const i0 = Math.floor(f) % n;
+      const i1 = (i0 + 1) % n;
+      const ft = f - Math.floor(f);
+      out.x = this.pathX[i0] + (this.pathX[i1] - this.pathX[i0]) * ft;
+      out.y = this.pathY[i0] + (this.pathY[i1] - this.pathY[i0]) * ft;
+      out.tx = this.pathTX[i0] + (this.pathTX[i1] - this.pathTX[i0]) * ft;
+      out.ty = this.pathTY[i0] + (this.pathTY[i1] - this.pathTY[i0]) * ft;
+      const tm = Math.hypot(out.tx, out.ty) || 1;
+      out.tx /= tm; out.ty /= tm;
+      out.nx = this.pathNX[i0] + (this.pathNX[i1] - this.pathNX[i0]) * ft;
+      out.ny = this.pathNY[i0] + (this.pathNY[i1] - this.pathNY[i0]) * ft;
+      const nm = Math.hypot(out.nx, out.ny) || 1;
+      out.nx /= nm; out.ny /= nm;
+      out.curv = this.pathCurv[i0];
+      return out;
+    }
+
+    /* 推进形态：圆环 ↔ 长条带 往复，并推进蛇形波 */
+    updateShape(now, dt) {
+      const c = this.cfg;
+      const mode = c.SHAPE_MODE || 'morph';
+
+      /* 形态目标 */
+      if (mode === 'ring') this.shapeTarget = 0;
+      else if (mode === 'band') this.shapeTarget = 1;
+      else {
+        this.shapeHoldT += dt;
+        if (this.shapeHoldT > (c.SHAPE_HOLD || 12)) {
+          this.shapeHoldT = 0;
+          this.shapeTarget = this.shapeTarget > 0.5 ? 0 : 1;
+        }
+      }
+      const rate = c.SHAPE_MORPH || 0.075;
+      this.shapeBlend += (this.shapeTarget - this.shapeBlend) * Math.min(1, rate * dt * 3);
+      if (this.shapeBlend < 0.001) this.shapeBlend = 0;
+      if (this.shapeBlend > 0.999) this.shapeBlend = 1;
+
+      this.shapeWavePhase += (c.SHAPE_WAVE_SPEED || 0) * dt;
+      this.pathLen = this.rebuildPath();
+
+      /* 目标半径随形态切换：圆环=目标半径，带子=带子半厚 */
+      const halfPx = Math.min(this.W, this.H) * 0.5;
+      const thickPx = (c.SHAPE_THICK || 0.07) * halfPx;
+      this.ringTarget = this.targetRadius +
+        (thickPx * 1.4 - this.targetRadius) * this.shapeBlend;
+
+      /* 每只鸟在带子上的参数：s 沿曲线、u 横向偏移 */
+      const N = this.N;
+      const half = Math.min(this.W, this.H) * 0.5;
+      const thick = (c.SHAPE_THICK || 0.07) * half;
+      if (!this.sInit) {
+        for (let i = 0; i < N; i++) {
+          this.sBuf[i] = i / N;
+          this.uBuf[i] = (((i * 2.399963) % 1) - 0.5) * 2 * thick;
+        }
+        this.sInit = true;
+      }
+      void now;
+      return this.shapeBlend;
+    }
+
+    /* ---------- 扰动（鼠标游隼 / 定时打乱 / 手动按键） ---------- */
+    /* 排定下一次定时打乱；AUTO_DISTURB 关闭时设为 Infinity（不打扰极限环） */
+    armAutoDisturb() {
+      const c = this.cfg;
+      this.autoDisturbAt = (c.AUTO_DISTURB === false)
+        ? Infinity
+        : this.t + c.DISTURB_AUTO_MIN * 0.001 +
+          this.rand() * c.DISTURB_AUTO_JITTER * 0.001;
+      return this.autoDisturbAt;
+    }
+
+    disturb(now, mode) {
+      const c = this.cfg, sec = now * 0.001;
+      this.lastDisturbTime = sec;
+      this.burstUntil = sec + c.BURST_TIME;
+      this.armAutoDisturb();
+
+      /* 打乱模式：全体速度方向随机化 → 环流被抹平，
+         随后只能靠同向对齐 / 切向扭矩重新组织出极限环。
+         这是"打乱后恢复"能被看见的关键。 */
+      const m = mode || c.DISTURB_MODE;
+      if (m === 'scatter') this.scatterAll(this.scatterPos);
+      else if (m === 'local') this.scatterLocal();
+      return this;
+    }
+
+    scatterAll(posSpread) {
+      const c = this.cfg, rand = this.rand, N = this.N;
+      const spread = c.SCATTER_SPREAD;
+      const ps = posSpread === undefined ? 0 : posSpread;
+      for (let i = 0; i < N; i++) {
+        const sp = Math.sqrt(this.vx[i] * this.vx[i] + this.vy[i] * this.vy[i]) || c.MAX_SPEED * 0.7;
+        const speed = sp * (0.85 + rand() * 0.3);
+        const a = rand() * Math.PI * 2;
+        const mix = 1 - Math.min(1, spread);
+        const ox = Math.cos(a), oy = Math.sin(a);
+        const nx = this.vx[i] / sp, ny = this.vy[i] / sp;
+        let dx = nx * mix + ox * spread;
+        let dy = ny * mix + oy * spread;
+        const m = Math.sqrt(dx * dx + dy * dy) || 1;
+        dx /= m; dy /= m;
+        this.vx[i] = dx * speed;
+        this.vy[i] = dy * speed;
+
+        /* 位置也抖散一点：破坏"环"的几何形状，恢复过程才需要真正重新凝聚 */
+        if (ps > 0) {
+          this.px[i] += (rand() - 0.5) * 2 * ps;
+          this.py[i] += (rand() - 0.5) * 2 * ps;
+        }
+      }
+      this.spin = 0;
+      this.localSwirl.fill(0);
+      this.relayOn = false;
+      this.relay = 0;
+      this.relayHold = 0;
+      /* 打乱瞬间：闪光 + 速度冲量，让"打乱"这一刻在视觉上非常明确 */
+      this.flash = c.SCATTER_FLASH;
+      const boost = 1 + c.SCATTER_IMPULSE;
+      for (let i = 0; i < N; i++) {
+        this.vx[i] *= boost;
+        this.vy[i] *= boost;
+      }
+    }
+
+    scatterLocal() {
+      const c = this.cfg, rand = this.rand;
+      const r2 = this.predatorRadius2;
+      for (let i = 0; i < this.N; i++) {
+        const dx = this.px[i] - this.predator.x, dy = this.py[i] - this.predator.y;
+        const d2 = dx * dx + dy * dy;
+        if (d2 > r2) continue;
+        const sp = Math.sqrt(this.vx[i] * this.vx[i] + this.vy[i] * this.vy[i]) || c.MAX_SPEED * 0.7;
+        const a = Math.atan2(dy, dx) + (rand() - 0.5) * 1.1;
+        this.vx[i] = Math.cos(a) * sp;
+        this.vy[i] = Math.sin(a) * sp;
+      }
+    }
+
+    /* ---------- 空间网格 ---------- */
+    buildGrid() {
+      const grid = this.grid, cell = this.cell;
+      for (let i = 0; i < grid.length; i++) grid[i].length = 0;
+      const cols = this.cols, rows = this.rows;
+      for (let i = 0; i < this.N; i++) {
+        let cx = (this.px[i] / cell) | 0;
+        let cy = (this.py[i] / cell) | 0;
+        if (cx < 0) cx = 0; else if (cx >= cols) cx = cols - 1;
+        if (cy < 0) cy = 0; else if (cy >= rows) cy = rows - 1;
+        grid[cy * cols + cx].push(i);
+      }
+    }
+
+    /* 遍历感知半径内的邻居 */
+    forNeighbors(i, callback) {
+      const cols = this.cols, rows = this.rows, grid = this.grid;
+      const per2 = this.perception2;
+      const xi = this.px[i], yi = this.py[i];
+      let cx = (xi / this.cell) | 0;
+      let cy = (yi / this.cell) | 0;
+      if (cx < 0) cx = 0; else if (cx >= cols) cx = cols - 1;
+      if (cy < 0) cy = 0; else if (cy >= rows) cy = rows - 1;
+      const x0 = cx > 0 ? cx - 1 : 0, x1 = cx + 1 < cols ? cx + 1 : cols - 1;
+      const y0 = cy > 0 ? cy - 1 : 0, y1 = cy + 1 < rows ? cy + 1 : rows - 1;
+      for (let gy = y0; gy <= y1; gy++) {
+        const rowBase = gy * cols;
+        for (let gx = x0; gx <= x1; gx++) {
+          const bucket = grid[rowBase + gx];
+          for (let b = 0; b < bucket.length; b++) {
+            const j = bucket[b];
+            if (j === i) continue;
+            const dx = this.px[j] - xi, dy = this.py[j] - yi;
+            const d2 = dx * dx + dy * dy;
+            if (d2 > per2 || d2 === 0) continue;
+            callback(j, dx, dy, d2);
+          }
+        }
+      }
+    }
+
+    /* ---------- 全局指标 + 相位判定 ---------- */
+    updateMetrics(dt) {
+      const N = this.N, px = this.px, py = this.py, vx = this.vx, vy = this.vy;
+      let gx = 0, gy = 0;
+      for (let i = 0; i < N; i++) { gx += px[i]; gy += py[i]; }
+      gx /= N; gy /= N;
+      this.gcx = gx; this.gcy = gy;
+
+      let sumR = 0, sumL = 0, sumV = 0, sumRad = 0, sumTan = 0, count = 0;
+      let meanVx = 0, meanVy = 0;
+      for (let i = 0; i < N; i++) {
+        const rx = px[i] - gx, ry = py[i] - gy;
+        const r = Math.sqrt(rx * rx + ry * ry);
+        sumR += r;
+        if (r > 1) {
+          sumL += (rx * vy[i] - ry * vx[i]) / r;
+          sumRad += (rx * vx[i] + ry * vy[i]) / r;
+          sumTan += (-ry * vx[i] + rx * vy[i]) / r;
+          count++;
+        }
+        sumV += Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]);
+        meanVx += vx[i];
+        meanVy += vy[i];
+      }
+      this.clusterRadius = sumR / N;
+      this.meanSpeed = sumV / N;
+      this.angMomentum = count ? sumL / count : 0;
+      this.radial = count ? sumRad / count : 0;
+      this.tangential = count ? sumTan / count : 0;
+      /* 全局定向度：整体平移速度的大小（成环时趋于 0，拉伸/溃散时变大） */
+      this.order = Math.sqrt(meanVx * meanVx + meanVy * meanVy) / N;
+
+      /* 每只鸟的"守护半径"：缓慢跟随（时间常数 ~2s），
+         于是环整体收缩/膨胀时大家一起跟着，但各自的乱窜被滤掉。 */
+      {
+        const oa = Math.min(1, dt * 0.5);
+        const orb = this.orbitR;
+        for (let i = 0; i < N; i++) {
+          const dxi = px[i] - gx, dyi = py[i] - gy;
+          const ri = Math.sqrt(dxi * dxi + dyi * dyi);
+          orb[i] = orb[i] > 0 ? orb[i] + (ri - orb[i]) * oa : ri;
+        }
+      }
+
+      const c = this.cfg;
+      const alpha = 1 - Math.pow(c.HYS_SMOOTH, dt * 60);
+      this.smoothedR += (this.clusterRadius - this.smoothedR) * alpha;
+
+      /* 环流有序度：各鸟切向速度的向量和（有序环流≈平均速率，杂乱打转≈0） */
+      let tanSumX = 0, tanSumY = 0;
+      for (let i = 0; i < N; i++) {
+        const rx = px[i] - gx, ry = py[i] - gy;
+        const r = Math.sqrt(rx * rx + ry * ry);
+        if (r < 1) continue;
+        const ux = rx / r, uy = ry / r;
+        tanSumX += ux * vx[i] + uy * vy[i];
+        tanSumY += ux * vy[i] - uy * vx[i];
+      }
+      this.rotationOrder = Math.sqrt(tanSumX * tanSumX + tanSumY * tanSumY) / N;
+
+      /* 极限环目标半径：环流越有序，允许的环越大（自持成环的关键） */
+      const coherence = Math.min(1, this.rotationOrder / (c.MAX_SPEED * 0.72));
+      const ring = smoothstep(c.RING_THRESHOLD,
+        Math.min(0.98, c.RING_THRESHOLD + 0.30), coherence);
+      this.coherence = coherence;
+      this.millGate = ring;
+
+      /* ---- 自旋手性（chirality）锁定 ----
+         全体鸟必须朝同一个转向旋转，才可能出现稳定的大尺度极限环；
+         否则会碎成各自打转的小涡旋（小范围打转的根因）。
+         手性只允许反转一次，且只在实测旋转明显反向时解锁。 */
+      const measured = this.tangential;
+
+      /* 手性锁定：慢跟随实测旋转，但只在出现"明确且持续反向"时解锁 */
+      if (this.chirality !== 0 && Math.sign(measured) === -this.chirality &&
+          Math.abs(measured) > c.MAX_SPEED * 0.5) {
+        this.chirality = Math.sign(measured);
+        this.spin = 0;
+      }
+      const targetSpin = this.chirality === 0 ? measured : Math.abs(measured) * this.chirality;
+      this.spin += (targetSpin - this.spin) * Math.min(1, c.SPIN_ADAPT * dt * 60);
+
+      this.updateRelay(dt);
+
+      const base = this.targetRadius;
+      /* 圆环模式下：目标半径 = 基础目标 × 继电器倍数（构成自持的半径振荡）。
+         带子模式下：ringTarget 由 updateShape 设为带子半厚，这里不覆盖。 */
+      if (this.shapeBlend < 0.001) {
+        const tgt = base * (this.relayTargetK || 1) *
+          (ring >= 1 ? 1 : Math.max(0.9, this.smoothedR / base));
+        this.ringTarget = tgt;
+      }
+
+      /* 相位判定（仅用于 HUD 显示） */
+      const sinceD = this.t - this.lastDisturbTime;
+      const dur = c.DISTURB_DURATION * 0.001;
+      this.disturbRatio = sinceD < dur ? Math.max(0, 1 - sinceD / dur) : 0;
+
+      let phase;
+      if (this.t < 8) phase = 'ribbon';
+      else if (this.disturbRatio > 0.55) phase = 'disturbed';
+      else if (this.disturbRatio > 0) phase = 'recover';
+      else if (this.shapeBlend > 0.6) phase = 'band';        // S 形流动带
+      else if (this.shapeBlend > 0.06) phase = 'morph';      // 正在成带 / 正在卷回
+      else if (this.clusterRadius > this.ringTarget * 1.10) phase = 'expand';
+      else if (this.clusterRadius < this.ringTarget * 0.80) phase = 'retract';
+      else if (this.millGate > 0.5 && this.clusterRadius > base * 0.7) phase = 'ring';
+      else phase = 'cohere';
+      this.phase = phase;
+    }
+
+    /* ---------- 半径继电器：自持极限环 ----------
+       目标在两个半径之间切换，切换条件是"真的到达"而不是时间到：
+
+         · 收紧段：目标 = base×RELAY_LOW，关掉向外泵、改用向内推力
+                   → 半径缩到足够接近下目标（或超时）→ 转扩张段
+         · 扩张段：目标 = base×RELAY_EXPAND，用径向泵把鸟群拉向它
+                   → 半径涨到足够接近上目标（或超时）→ 转收紧段
+
+       因为切换靠"到达"，周期由鸟群自身弛豫速度决定；
+       超时只作兜底，保证永远不会卡死在某个相位（之前两次失败的原因）。 */
+    updateRelay(dt) {
+      const c = this.cfg;
+      const r = this.clusterRadius;
+      const base = this.targetRadius;
+      const lowT = base * (c.RELAY_LOW || 0.62);
+      const highT = base * (c.RELAY_EXPAND || 1.30);
+      const tol = c.RELAY_TOL || 0.10;
+
+      if (!this.relayOn) {
+        this.relayRMin = Math.min(this.relayRMin, r);
+        this.relayDrawT += dt;
+        if (r <= lowT * (1 + tol) || this.relayDrawT > (c.RELAY_DRAW_MAX || 3.5)) {
+          this.relayOn = true;
+          this.relaySwellT = 0;
+          this.relayRMax = r;
+        }
+      } else {
+        this.relayRMax = Math.max(this.relayRMax, r);
+        this.relaySwellT += dt;
+        if (r >= highT * (1 - tol) || this.relaySwellT > (c.RELAY_SWELL_MAX || 9.0)) {
+          this.relayOn = false;
+          this.relayDrawT = 0;
+          this.relayRMin = r;
+        }
+      }
+
+      const goal = this.relayOn ? 1 : 0;
+      this.relay += (goal - this.relay) * Math.min(1, c.RELAY_RAMP * dt);
+      this.spinDrive = c.RELAY_OFF_SPIN + (c.RELAY_ON_SPIN - c.RELAY_OFF_SPIN) * this.relay;
+
+      /* 目标半径在上下目标之间平滑切换 */
+      this.relayTarget = lowT + (highT - lowT) * this.relay;
+      this.relayTargetK = this.relayTarget / Math.max(1, base);
+
+      /* ---- 按相位调制"向内"的那些力，让拉伸与恢复都看得见 ----
+         拉伸段（relay=1）：内聚力/压力/拉力全部放松 → 半径能真正被撑开；
+                           分离斥力放大 → 鸟跟着铺开。
+         收紧段（relay=0）：恢复内聚力/压力/拉力 + 额外向内推力 → 明显回缩。 */
+      const relax = this.relay;              // 1 = 拉伸段
+      const pkLo = c.RELAY_PACK === undefined ? 1 : c.RELAY_PACK;
+      const pkHi = c.RELAY_PACK_HI === undefined ? 1 : c.RELAY_PACK_HI;
+      this.sepPack = pkLo + (pkHi - pkLo) * relax;
+      const spLo = 1;
+      const spHi = c.RELAY_SPACING_HI === undefined ? 1 : c.RELAY_SPACING_HI;
+      this.spacingPack = spLo + (spHi - spLo) * relax;
+      this.relayShove = (c.RELAY_SHOVE || 0) * (1 - relax);
+      /* 拉伸段：把内向压力/拉力/内聚按 RELAY_RELAX 放松，否则半径涨不上去 */
+      const rlx = c.RELAY_RELAX === undefined ? 1 : c.RELAY_RELAX;
+      this.pressScale = 1 - (1 - rlx) * relax;
+      this.relayPull = (c.RELAY_PULL || 0) * (1 - relax) * (c.RELAY_PULL_DRAW === undefined ? 1 : c.RELAY_PULL_DRAW);
+      return this.relay;
+    }
+
+    /* ---------- 主更新 ---------- */
+    step(dt, now, predator) {
+      const c = this.cfg;
+      if (dt === undefined) dt = 1 / 60;
+      if (now === undefined) now = (this.t + dt) * 1000;
+      if (dt < 0.004) return;
+      if (dt > 0.05) dt = 0.05;
+      const ds = dt * 60;
+      this.t = now / 1000;
+      this.frames++;
+      if (this.flash > 0) this.flash = Math.max(0, this.flash - c.FLASH_DECAY * dt);
+
+      this.updateMetrics(dt);
+
+      /* S 形流动带：推进形态、重建中心线 */
+      this.updateShape(now, dt);
+      const shapeBlend = this.shapeBlend;
+
+      /* 游隼只有真正冲到鸟群附近才算"扰动中"；
+         否则鼠标停在屏幕任意角落都会一直压制对齐/内聚，鸟群永远成不了环。 */
+      if (predator && predator.active) {
+        const pdx = predator.x - this.gcx, pdy = predator.y - this.gcy;
+        if (pdx * pdx + pdy * pdy <
+            Math.pow(this.predatorRadius + this.clusterRadius, 2)) {
+          this.lastDisturbTime = this.t;
+        }
+      }
+      if (this.t >= this.autoDisturbAt) this.disturb(this.t * 1000);
+
+      const disturbRatio = this.disturbRatio;
+      const alignMul = 1 - disturbRatio * (1 - c.DISTURB_ALIGN_DAMP);
+      const cohesionMul = 1 - disturbRatio * (1 - c.DISTURB_COHESION_DAMP);
+      const millMul = 1 - disturbRatio * (1 - c.DISTURB_MILL_DAMP);
+      const deswirlBoost = 1 + disturbRatio * (c.DISTURB_DESWIRL_BOOST - 1);
+      /* 打乱后加强自旋力矩：环流刚被抹平时需要更大的扭矩才能重新组织起来 */
+      const spinBoost = 1 + disturbRatio * ((c.DISTURB_SPIN_BOOST || 1) - 1);
+
+      const burst = this.t < this.burstUntil ? 1 : 0;
+
+      const targetR = this.targetRadius;
+      const hystRef = c.HYS_REF * targetR;
+      const hyst = (this.smoothedR - hystRef) / Math.max(1, hystRef);
+      const pressureGain = c.PRESSURE_K * c.HYS_GAIN * hyst;
+
+      const antiCollapse = Math.max(0, 1 - this.clusterRadius / targetR) * c.ANTI_COLLAPSE_STRENGTH;
+      const spinDrive = this.spinDrive;
+      const relayPull = this.relayPull;
+
+      /* 全局去旋转：只在角动量接近极端时介入 */
+      const absRot = Math.abs(this.angMomentum) / c.MAX_SPEED;
+      let deswirl = 0;
+      if (absRot > c.DESWIRL_THRESHOLD) {
+        const excess = (absRot - c.DESWIRL_THRESHOLD) / (c.DESWIRL_FULL - c.DESWIRL_THRESHOLD);
+        deswirl = Math.sign(this.angMomentum) * Math.min(1, excess) * c.DESWIRL_STRENGTH * deswirlBoost;
+      }
+
+      const N = this.N, rand = this.rand;
+      const px = this.px, py = this.py, vx = this.vx, vy = this.vy;
+      const localSwirl = this.localSwirl;
+      const W = this.W, H = this.H;
+      const sepR = this.separationR, sepR2 = this.separation2;
+      const minSep = this.minSepDist;
+      /* "近"= 小于最小分离距离的 3 倍：这些邻居的数量反映拥挤程度 */
+      const nearR = minSep * 3;
+      const nearR2 = nearR * nearR;
+      const sepCrowdGain = Math.max(1, c.SEP_CROWD_GAIN || 1);
+      const sepCrowdKnee = Math.max(0.02, c.SEP_CROWD_KNEE || 0.35);
+      /* 本密度斥力用的"期望间距"与"健康邻居数" */
+      const spacingPack = this.spacingPack === undefined ? 1 : this.spacingPack;
+      const sepSpacing = Math.max(4, (c.SEP_SPACING || 26) * this.scaleK * spacingPack);
+      const spacing2 = sepSpacing * sepSpacing;
+      const sepDensityWeight = Math.max(0, c.SEP_DENSITY_WEIGHT || 0);
+      const densSmooth = Math.min(0.99, Math.max(0, c.SEP_DENSITY_SMOOTH === undefined ? 0.9 : c.SEP_DENSITY_SMOOTH));
+      const densKnee = c.SEP_DENSITY_KNEE === undefined ? 1 : c.SEP_DENSITY_KNEE;
+      const accelMax = c.ACCEL_MAX === undefined ? 0 : c.ACCEL_MAX;
+      const accSmooth = Math.min(0.95, Math.max(0, c.ACC_SMOOTH === undefined ? 0 : c.ACC_SMOOTH));
+      const sepExpected = (c.SEP_DENSITY_K || 0) * (sepSpacing * sepSpacing) /
+        (this.targetRadius * this.targetRadius) * N;
+      const localMinD2 = this.localMinDist2;
+      const maxF = c.MAX_FORCE;
+      const gcx = this.gcx, gcy = this.gcy;
+      const chirality = this.chirality;
+      const wSep = this.wSep, wAli = this.wAli, wCoh = this.wCoh, wMill = this.wMill;
+      const millFloor = Math.max(this.millGate, 0.25);
+      const tgt = this.ringTarget;                 // 当前目标半径（继电器驱动）
+      const relayShove = this.relayShove || 0;     // 收紧段的额外向内推力
+      const sepPack = this.sepPack === undefined ? 1 : this.sepPack;
+      const pressScale = this.pressScale === undefined ? 1 : this.pressScale;
+
+      /* ---- S 形流动带：引导场参数 ---- */
+      const guideW = shapeBlend;                   // 0=圆环, 1=带子
+      const orbitW = 1 - guideW;                   // 圆环模式权重
+      const radialW = orbitW;                      // 径向各项力也随圆环模式生效
+      const guideSpeed = c.SHAPE_SPEED || 5.6;
+      const guideThick = (c.SHAPE_THICK || 0.07) * Math.min(W, H) * 0.5;
+      const guideField = (c.SHAPE_FIELD || 0.85) * guideW;
+      const guideAlign = (c.SHAPE_ALIGN || 0.55) * guideW;
+      const guideClamp = c.SHAPE_CURVE_CLAMP || 0.85;
+      /* 游隼的影响半径：跟着鸟群尺寸走（惊散范围够大才看得出来） */
+      const predatorRadius = this.predatorRadius;
+      let guideSuppress = 1;                       // 游隼附近把引导场压下去
+      let panicLevel = 0;                          // 本帧最大 panic（被游隼惊到的程度）
+      const sBuf = this.sBuf, uBuf = this.uBuf;
+      const _hit = this.hitBuf;
+      /* 带子上鸟的推进量（按各自 s 计算，供后面使用） */
+      const sAdvance = guideW > 0 ? guideSpeed / this.pathLen : 0;
+
+      this.buildGrid();
+
+      /* ---- 第一遍：邻域统计 + 受力 + 积分 ---- */
+      for (let i = 0; i < N; i++) {
+        let sepN = 0;
+        let aliX = 0, aliY = 0, aliN = 0;
+        let cohX = 0, cohY = 0, cohN = 0;
+        let swirl = 0, swirlN = 0;
+        let nearN = 0;
+        const vxi = vx[i], vyi = vy[i];
+        let fleeX = 0, fleeY = 0;      // 逃跑力（独立通道，不参与预算缩放）
+
+        this.forNeighbors(i, function (j, dx, dy, d2) {
+          if (d2 < sepR2) sepN++;
+          if (d2 < nearR2) nearN++;
+          aliX += vx[j]; aliY += vy[j]; aliN++;
+          cohX += px[j]; cohY += py[j]; cohN++;
+          if (d2 > localMinD2) {
+            const d = Math.sqrt(d2);
+            const rvx = vx[j] - vxi, rvy = vy[j] - vyi;
+            swirl += (-dy * rvx + dx * rvy) / (d * d);
+            swirlN++;
+          }
+        });
+
+        const rawSwirl = swirlN > 0 ? swirl / swirlN : 0;
+        localSwirl[i] = localSwirl[i] * c.LOCAL_SWIRL_SMOOTH + rawSwirl * (1 - c.LOCAL_SWIRL_SMOOTH);
+
+        const invN = aliN > 0 ? 1 / aliN : 0;
+        let axSum = 0, aySum = 0;
+
+        /* 分离：按拥挤程度加强。
+           若只按"感知邻居总数"做平均，几十个邻居会把排斥稀释掉，
+           自旋力矩一压就形成大面积堆积（看起来鸟变少）。 */
+        if (sepN > 0) {
+          const nearFrac = nearN * invN;
+          let crowd = 1;
+          if (sepCrowdGain > 1 && nearFrac < sepCrowdKnee) {
+            crowd = 1 + (sepCrowdGain - 1) * (1 - nearFrac / sepCrowdKnee);
+          }
+          const sepRscope = sepR * (1 + (Math.min(crowd, sepCrowdGain) - 1) * 0.35);
+          const scope2 = sepRscope * sepRscope;
+          let sx = 0, sy = 0, sn = 0;
+          this.forNeighbors(i, function (j, dx, dy, d2) {
+            if (d2 >= scope2) return;
+            const d = Math.sqrt(d2);
+            const strength = 1 - d / sepRscope;
+            const inv = 1 / Math.max(d, minSep);
+            sx -= dx * inv * strength;
+            sy -= dy * inv * strength;
+            sn++;
+          });
+          if (sn > 0) {
+            sx /= sn; sy /= sn;
+            const m = Math.sqrt(sx * sx + sy * sy);
+            if (m > maxF) { const s = maxF / m; sx *= s; sy *= s; }
+            const sepScale = wSep * crowd * sepPack;
+            axSum += sx * sepScale;
+            aySum += sy * sepScale;
+          }
+
+          /* 本密度斥力：中心堆积克星。
+             在 d < sepSpacing 的范围内数邻居，并取它们的局部质心；
+             邻居数超过"健康值"就沿"背离局部质心"方向外推。
+             注意：局部质心用真实邻居坐标（不是叠加位移，避免相互抵消）。 */
+          let denseX = 0, denseY = 0, denseN = 0;
+          this.forNeighbors(i, function (j, dx, dy, d2) {
+            if (d2 >= spacing2) return;
+            denseN++;
+            denseX += px[j];
+            denseY += py[j];
+          });
+          if (denseN > 0) {
+            const expected = sepExpected > 0.5 ? sepExpected : 1;
+            /* 密度估计做时间平滑：邻居进出计数半径会让"拥挤比"跳变，
+               直接喂给力就是高频震颤。 */
+            const rawRatio = denseN / expected;
+            this.densBuf[i] = this.densBuf[i] * densSmooth + rawRatio * (1 - densSmooth);
+            let ratio = this.densBuf[i];
+            if (ratio > 2.5) ratio = 2.5;
+            /* 软启动：只有"明显过密"才给力，且起步平滑，避免在阈值附近反复开关 */
+            if (ratio > densKnee) {
+              const cmx = denseX / denseN, cmy = denseY / denseN;
+              let ox = px[i] - cmx, oy = py[i] - cmy;
+              const om = Math.sqrt(ox * ox + oy * oy);
+              if (om > 1e-6) {
+                ox /= om; oy /= om;
+              } else if (nearN > 0) {
+                /* 极端情况：几乎重合且质心重合 → 用近邻平均方向兜底 */
+                let bx = 0, by = 0, bn = 0;
+                this.forNeighbors(i, function (j, dx, dy, d2) {
+                  if (d2 >= nearR2 || d2 === 0) return;
+                  const d = Math.sqrt(d2);
+                  bx -= dx / d; by -= dy / d; bn++;
+                });
+                if (bn > 0) {
+                  const bm = Math.sqrt(bx * bx + by * by);
+                  ox = bx / bm; oy = by / bm;
+                } else {
+                  const a2 = (i * 2.399963) % (Math.PI * 2);
+                  ox = Math.cos(a2); oy = Math.sin(a2);
+                }
+              } else {
+                const a2 = (i * 2.399963) % (Math.PI * 2);
+                ox = Math.cos(a2); oy = Math.sin(a2);
+              }
+              /* 软启动：excess 从 0 连续增长，而不是在 ratio=1 处阶跃 */
+              const excess = (ratio - densKnee) / (2.5 - densKnee);
+              const press = excess * sepDensityWeight * sepPack;
+              axSum += ox * press;
+              aySum += oy * press;
+            }
+          }
+        }
+
+        if (aliN > 0) {
+          /* 速度对齐（panic 时压低 → 鸟才肯四散而不是跟着邻居一起转弯） */
+          const avx = aliX * invN, avy = aliY * invN;
+          let dxa = avx - vxi, dya = avy - vyi;
+          let m = Math.sqrt(dxa * dxa + dya * dya);
+          if (m > maxF) { const s = maxF / m; dxa *= s; dya *= s; }
+          const rebel = this.isRebel[i] ? c.REBEL_ALIGN_FACTOR : 1;
+          const aw = wAli * alignMul * rebel * (1 - 0.85 * panicLevel);
+          axSum += dxa * aw;
+          aySum += dya * aw;
+
+          /* 切向对齐 → 成环（milling）：带子模式下由引导场接管，这里按权重淡出 */
+          const amx = cohX * invN, amy = cohY * invN;
+          let rx = amx - px[i], ry = amy - py[i];
+          let rlen = Math.sqrt(rx * rx + ry * ry);
+          if (rlen < 1e-3) { rx = 1; ry = 0; rlen = 1; }
+          const nx = rx / rlen, ny = ry / rlen;
+          const tx = -ny, ty = nx;
+          const vt = avx * tx + avy * ty;
+          let fx = tx * vt - vxi, fy = ty * vt - vyi;
+          m = Math.sqrt(fx * fx + fy * fy);
+          if (m > maxF) { const s = maxF / m; fx *= s; fy *= s; }
+          const mw = wMill * millMul * (1 - guideW);
+          axSum += fx * mw;
+          aySum += fy * mw;
+        }
+
+        /* ---- S 形流动带的引导场 ----
+           沿中心线以 SHAPE_SPEED 流动，横向被弹簧拉回 s 对应的目标点。
+           每只鸟自带 s（沿曲线）与 u（横向偏移），因此鸟群既成"带"又保持流动。 */
+        if (guideW > 0) {
+          sBuf[i] += sAdvance * (1 + 0.15 * (uBuf[i] / Math.max(1, guideThick)));
+          if (sBuf[i] >= 1) sBuf[i] -= 1;
+          else if (sBuf[i] < 0) sBuf[i] += 1;
+          this.lookupPath(sBuf[i], _hit);
+          /* 横向偏移受曲率限制（防止内侧折叠） */
+          const uMax = _hit.curv > 1e-6
+            ? Math.min(guideThick, guideClamp / _hit.curv)
+            : guideThick;
+          let u = uBuf[i];
+          if (u > uMax) u = uMax; else if (u < -uMax) u = -uMax;
+          const tX = _hit.x + _hit.nx * u;
+          const tY = _hit.y + _hit.ny * u;
+          /* guideSuppress：游隼冲进来时把引导场压下去，惊散才看得出来 */
+          const gField = guideField * guideSuppress;
+          const gAlign = guideAlign * guideSuppress;
+          /* ---- 速度空间控制（关键修正）----
+             原来是把"目标速度 = 当前速度 + 位置误差×SHAPE_FIELD"再转成力，
+             等效于一根很硬的位置弹簧：位置误差越大，速度就越偏向"径向纠偏"，
+             于是鸟的速度方向与带的切向差得很多 —— 实测带上局部方向偏差中位 30°，
+             而圆环模式只有 3.9°（因为圆环用的是速度空间的目标）。
+             改成同样在速度空间做：
+               目标速度 = 切向·guideSpeed + 横向·(位置误差/横向时间常数)
+             这样合力方向天然就是"目标速度 − 当前速度"，
+             位置误差只经由较慢的横向时间常数体现，不再直接扭转速度方向。 */
+/* ---- 路径跟踪：最小距离投影 + 有界横向速度 ----
+             参考点必须用"曲线上离自己最近的点"。原先用 sBuf（沿曲线的流参数），
+             鸟一飘离带子 sBuf 就与真实最近点脱钩，误差算错 → 越飘越远（实测 364→395px）。
+             横向修正也不再是"误差/τ"（那会给出 19~30px/帧的横向速度，把速度方向扭乱），
+             而是把横向速度限幅到 guideSpeed 的固定比例，保证引导力能被预算容纳。 */
+          this.projectPath(i, px[i], py[i], _hit);
+          const eRaw = _hit.eCross;
+          const eCap = guideThick * (c.SHAPE_LAT_E_CAP === undefined ? 4.0 : c.SHAPE_LAT_E_CAP);
+          let eUse = eRaw;
+          if (eUse > eCap) eUse = eCap; else if (eUse < -eCap) eUse = -eCap;
+          const dead = guideThick * (c.SHAPE_LAT_DEAD === undefined ? 0.35 : c.SHAPE_LAT_DEAD);
+          let vl = 0;
+          if (eUse > dead) vl = -(eUse - dead) / (c.SHAPE_LAT_TAU || 9);
+          else if (eUse < -dead) vl = -(eUse + dead) / (c.SHAPE_LAT_TAU || 9);
+          const vCap = guideSpeed * (c.SHAPE_LAT_CAP === undefined ? 0.55 : c.SHAPE_LAT_CAP);
+          if (vl > vCap) vl = vCap; else if (vl < -vCap) vl = -vCap;
+          /* 目标速度 = 切向流动 + 有界横向修正（最多偏 atan(vCap/speed) ≈ 29°） */
+          const vtX = _hit.tx * guideSpeed + _hit.nx * vl;
+          const vtY = _hit.ty * guideSpeed + _hit.ny * vl;
+          axSum += (vtX - vxi) * gField;
+          aySum += (vtY - vyi) * gField;
+          /* 弱切向对齐：保底让带里的鸟朝向一致（不参与位置约束） */
+          if (gAlign > 0) {
+            axSum += (_hit.tx * guideSpeed - vxi) * gAlign;
+            aySum += (_hit.ty * guideSpeed - vyi) * gAlign;
+          }
+        }
+
+        /* ---- 轨道驱动：让整个环以"同一个角速度"转动 ----
+           原来每只鸟的目标切向速度都相同（SPIN_TARGET 常数），
+           于是角速度 = 目标速度/r 各不相同：内圈鸟角速度远大于外圈，
+           看起来就是“环在转，同时每只鸟自己还在转小圈”
+           （实测单鸟局部回转半径中位只有整体半径的 1/3）。
+           改成刚体式的目标：切向速度 ∝ 半径，
+             ω = SPIN_W / 目标半径
+             vt_target = ω × r
+           所有鸟角速度一致 → 整体是一圈干净的行星式环绕。
+           再叠一点"向本半径处平均切向速度对齐"（有界），保留鸟群的自组织感。 */
+        {
+          const rrx = px[i] - gcx, rry = py[i] - gcy;
+          const rr = Math.sqrt(rrx * rrx + rry * rry);
+          if (rr > 1) {
+            const ux = rrx / rr, uy = rry / rr;
+            const tanX = -uy * chirality, tanY = ux * chirality;
+            const vt = vxi * tanX + vyi * tanY;
+            const drive = spinDrive * spinBoost;
+            const omega = c.SPIN_W / Math.max(1, targetR);
+            /* 目标切向速度 ∝ 半径（刚体旋转），上限 MAX_SPEED */
+            let vtTarget = omega * rr * drive;
+            const vtCap = c.MAX_SPEED * 0.96;
+            if (vtTarget > vtCap) vtTarget = vtCap;
+            const need = vtTarget - vt;
+            /* 关键：把速度方向真正掰到"沿轨道切向"。
+               只用"切向速度不足才补"（need 为正）时，鸟一旦径向速度偏大
+               就不会被纠正，于是到处乱飘、看起来像各自转小圈。
+               这里改成双向比例控制：切向偏慢就加速、切向偏快（说明在乱飘）
+               就减速，把速度方向收敛到圆周切向。 */
+            if (Math.abs(need) > c.SPIN_DEADZONE * 0.5) {
+              const sf = Math.min(maxF, Math.abs(need)) *
+                c.SPIN_WEIGHT * drive * (need > 0 ? 1 : c.SPIN_BRAKE);
+              axSum += tanX * sf * (need > 0 ? 1 : -1);
+              aySum += tanY * sf * (need > 0 ? 1 : -1);
+            }
+          }
+        }
+
+        /* ---- 局部量：涡旋抑制 / 径向压力 / 反小圈 ---- */
+        {
+          let amx = px[i], amy = py[i];
+          if (aliN > 0) { amx = cohX * invN; amy = cohY * invN; }
+          let rx = amx - px[i], ry = amy - py[i];
+          let rlen = Math.sqrt(rx * rx + ry * ry);
+          if (rlen < 1e-3) { rx = 1; ry = 0; rlen = 1; }
+          const nx = rx / rlen, ny = ry / rlen;
+
+          /* 局部小漩涡抑制（只压制真正的小尺度漩涡） */
+          const sv = localSwirl[i];
+          if (Math.abs(sv) > c.LOCAL_SWIRL_THRESHOLD) {
+            const excess = Math.abs(sv) - c.LOCAL_SWIRL_THRESHOLD;
+            const lf = Math.sign(sv) * excess * c.LOCAL_SWIRL_STRENGTH;
+            axSum += -ny * lf;
+            aySum += nx * lf;
+          }
+
+          /* ---- 半径锁定（圆环模式的"干净环流"）----
+             实测每只鸟的半径会在 ±180~570px 之间乱窜（几乎横跨整个环宽），
+             于是它在环里里外穿梭、看起来像"各自转小圈"。
+             真环流应该每只鸟守住自己的半径：给每只鸟一个缓慢自适应的
+             目标半径（跟随环的整体膨胀/收缩，但不跟随自己的乱窜），
+             再按偏差给一个温和的径向弹簧。
+             带子模式（guideW→1）下这套会跟引导场打架，按 (1-guideW) 淡出。 */
+          const rr2x = px[i] - gcx, rr2y = py[i] - gcy;
+          const rr2 = Math.sqrt(rr2x * rr2x + rr2y * rr2y);
+
+          /* ---- 半径锁定（圆环模式的"干净环流"）----
+             逐帧实测：每只鸟的半径会在 ±180~570px 之间乱窜（几乎横跨整个环宽），
+             于是它在环内里外穿梭，看起来就像"各自在转小圈"。
+             真环流应该每只鸟守住自己的半径：给每只鸟一个缓慢自适应的目标半径
+             （跟随环整体的膨胀/收缩，但不跟随自己的乱窜），再按偏差给径向弹簧。
+             带子模式（guideW→1）下会跟引导场打架，按 (1-guideW) 淡出。 */
+          if (orbitW > 0 && rr2 > 1) {
+            const lock = c.ORBIT_LOCK || 0;
+            if (lock > 0) {
+              const ux3 = rr2x / rr2, uy3 = rr2y / rr2;
+              const dev = (rr2 - this.orbitR[i]) / Math.max(1, targetR);
+              let f3 = -dev * lock * orbitW;
+              const lim = c.ORBIT_LOCK_MAX === undefined ? 0.5 : c.ORBIT_LOCK_MAX;
+              if (f3 > lim) f3 = lim; else if (f3 < -lim) f3 = -lim;
+              axSum += ux3 * f3;
+              aySum += uy3 * f3;
+            }
+          }
+
+          if (radialW > 0.001 && rr2 > 1) {
+            const ux2 = rr2x / rr2, uy2 = rr2y / rr2;            if (relayShove <= 0) {
+              let dp = (tgt - rr2) / Math.max(1, tgt);
+              dp = Math.max(-0.8, Math.min(0.8, dp));
+              const pumpF = dp * c.PUMP_REF * radialW;
+              axSum += ux2 * pumpF;
+              aySum += uy2 * pumpF;
+            } else {
+              /* 收紧段：额外向内压，把环压到明显更小 */
+              const shoveW = relayShove * millFloor * radialW;
+              axSum -= ux2 * shoveW;
+              aySum -= uy2 * shoveW;
+            }
+          }
+
+          /* 径向压力 + 迟滞反馈：把形状约束在一个环带内。
+             拉伸段按 pressScale 放松 —— 这几股内向力正是"拉伸涨不上去"的原因。 */
+          const R = tgt * (1 - c.RING_BAND);
+          let p = 0;
+          if (rlen > tgt * (1 + c.RING_BAND)) {
+            p = (rlen - tgt) / Math.max(1, tgt);
+          } else if (rlen < R) {
+            p = (rlen - R) / Math.max(1, R);
+          }
+          p = Math.max(-0.9, Math.min(1.2, p));
+          const pf = -(p * 1.35 + pressureGain + relayPull) * millFloor * pressScale;
+          axSum += nx * pf;
+          aySum += ny * pf;
+
+          /* 逃出小圈：半径远小于目标时向外推（带子模式不需要） */
+          if (radialW > 0.5 && rlen < targetR * c.ANTICOIL_RATIO) {
+            const push = (1 - rlen / (targetR * c.ANTICOIL_RATIO)) * c.ANTICOIL_WEIGHT;
+            axSum += nx * push;
+            aySum += ny * push;
+          }
+        }
+
+        /* 径向阻尼：抑制高频抖动，让半径的往复干净可读（带子模式淡出） */
+        if (c.RADIAL_DAMP > 0 && guideW < 0.999) {
+          const dampW = c.RADIAL_DAMP * (1 - guideW);
+          const rrx = px[i] - gcx, rry = py[i] - gcy;
+          const rr = Math.sqrt(rrx * rrx + rry * rry);
+          if (rr > 1) {
+            const ux = rrx / rr, uy = rry / rr;
+            const vr = vxi * ux + vyi * uy;
+            axSum -= ux * vr * dampW;
+            aySum -= uy * vr * dampW;
+          }
+        }
+
+        /* 聚集（panic 时也压低 → 否则内聚力把惊散的鸟立刻拉回原处） */
+        if (cohN > 0) {
+          const mx = cohX / cohN, my = cohY / cohN;
+          let dx = mx - px[i], dy = my - py[i];
+          let m = Math.sqrt(dx * dx + dy * dy);
+          if (m > maxF) { const s = maxF / m; dx *= s; dy *= s; }
+          const cw = wCoh * cohesionMul * (1 - 0.9 * panicLevel);
+          axSum += dx * cw;
+          aySum += dy * cw;
+        }
+
+        /* 游隼（鼠标）—— 要让"惊散"看得出来：
+           1) 影响半径随鸟群尺寸放大
+           2) "线性 + 平方"混合衰减，远处仍有推力
+           3) burst（刚移动的 0.85s）额外加成
+           4) 被惊到的鸟进入 panic：本帧给它单独的加速度预算与更高速度上限，
+              并压低内聚/对齐 —— 否则"加速度预算 + 鸟群回拉力"会把惊散完全吃掉
+              （实测只散开 2%）
+           5) 侧向分量 → 被惊到的鸟绕开而不是只沿径向弹开
+           6) 压制带子引导场，否则引导场立刻把鸟拉回带上 */
+        if (predator && predator.active) {
+          const dx = px[i] - predator.x, dy = py[i] - predator.y;
+          const d2 = dx * dx + dy * dy;
+          const predR = predatorRadius;
+          if (d2 < predR * predR && d2 > 1) {
+            const d = Math.sqrt(d2);
+            const t = 1 - d / predR;
+            const fear = t * (0.45 + 0.55 * t);        // 远处也有 0.45 的权重
+            const burstK = 1 + burst * 1.8;
+            const fm = fear * c.PREDATOR_MAX_FORCE * burstK;
+            const ux = dx / d, uy = dy / d;
+            /* 逃跑力单独记账，不参与下面的加速度预算缩放 ——
+               否则预算限幅会把惊散一起削掉（实测只散开 3%）。 */
+            fleeX += ux * fm * c.PREDATOR_FORCE;
+            fleeY += uy * fm * c.PREDATOR_FORCE;
+            /* 侧向分量：被惊到的鸟绕开而不是只沿径向弹开（左右交替 → 整体散开） */
+            const side = fear * burstK * c.PREDATOR_SIDE;
+            const sgnSide = (i & 1) ? 1 : -1;
+            fleeX += -uy * side * sgnSide;
+            fleeY += ux * side * sgnSide;
+            /* panic：靠近游隼的鸟临时获得更高预算与速度上限，并压低内聚/对齐 */
+            const panic = Math.min(1, fear * burstK);
+            if (panic > panicLevel) panicLevel = panic;
+            if (guideW > 0) {
+              const sup = 1 - 0.9 * panic;
+              if (sup < guideSuppress) guideSuppress = sup;
+            }
+          }
+        }
+
+        /* 反塌缩 */
+        if (antiCollapse > 0) {
+          const rx = px[i] - gcx, ry = py[i] - gcy;
+          const r = Math.sqrt(rx * rx + ry * ry) + 1;
+          axSum += (rx / r) * antiCollapse;
+          aySum += (ry / r) * antiCollapse;
+        }
+
+        /* 全局去旋转（软上限） */
+        if (deswirl !== 0) {
+          const rx = px[i] - gcx, ry = py[i] - gcy;
+          const r = Math.sqrt(rx * rx + ry * ry);
+          const lim = targetR * c.DESWIRL_TAU;
+          if (r > lim) {
+            const damp = (r - lim) / Math.max(1, targetR);
+            axSum -= (-ry / r) * deswirl * Math.min(1.4, damp * 2.2);
+            aySum -= (rx / r) * deswirl * Math.min(1.4, damp * 2.2);
+          }
+        }
+
+        /* 边界软推 */
+        if (px[i] < this.edgeMargin) axSum += (this.edgeMargin - px[i]) * c.EDGE_FORCE;
+        else if (px[i] > W - this.edgeMargin) axSum -= (px[i] - (W - this.edgeMargin)) * c.EDGE_FORCE;
+        if (py[i] < this.edgeMargin) aySum += (this.edgeMargin - py[i]) * c.EDGE_FORCE;
+        else if (py[i] > H - this.edgeMargin) aySum -= (py[i] - (H - this.edgeMargin)) * c.EDGE_FORCE;
+
+        /* 噪声 */
+        if (c.NOISE > 0) {
+          axSum += (rand() - 0.5) * c.NOISE;
+          aySum += (rand() - 0.5) * c.NOISE;
+        }
+
+        /* 全局加速度预算：所有力共享同一个上限。
+           没有这一层时，引导场/密度斥力的合力可达 MAX_FORCE 的 10 倍以上，
+           单帧速度突变过大 → 内侧鸟的可见高频震颤。 */
+        /* 运动平滑：把本帧合力与上一帧合力做低通，再限幅。
+           没有这一层时，加速度方向每帧都可能翻转（实测 ~18 次/秒），
+           画面上就是"抖/跳"而不是平滑滑行。 */
+        if (accSmooth > 0) {
+          const k = 1 - accSmooth;
+          axSum = axSum * k + this.aSmoothX[i] * accSmooth;
+          aySum = aySum * k + this.aSmoothY[i] * accSmooth;
+        }
+        this.aSmoothX[i] = axSum;
+        this.aSmoothY[i] = aySum;
+
+        if (accelMax > 0) {
+          /* panic 中的鸟获得更高预算，才能真正被驱散 */
+          const budget = accelMax * (1 + panicLevel * (c.PANIC_ACCEL - 1));
+          const a2sum = axSum * axSum + aySum * aySum;
+          if (a2sum > budget * budget) {
+            const sc = budget / Math.sqrt(a2sum);
+            axSum *= sc;
+            aySum *= sc;
+          }
+        }
+
+        /* 逃跑力最后叠加在前面限幅过的合力之上（不被预算削掉） */
+        axSum += fleeX;
+        aySum += fleeY;
+
+        /* 积分 */
+        let nvx = vxi + axSum * ds;
+        let nvy = vyi + aySum * ds;
+        const damp = Math.pow(c.DAMPER, ds);
+        nvx *= damp; nvy *= damp;
+
+        let sp2 = nvx * nvx + nvy * nvy;
+        /* panic 时允许比巡航更快的冲刺 */
+        const maxSp = c.MAX_SPEED * (1 + panicLevel * (c.PANIC_SPEED - 1));
+        const maxS2 = maxSp * maxSp;
+        if (sp2 > maxS2) { const s = maxSp / Math.sqrt(sp2); nvx *= s; nvy *= s; sp2 = maxS2; }
+        const minS2 = c.MIN_SPEED * c.MIN_SPEED;
+        if (sp2 < minS2) {
+          if (sp2 > 1e-6) { const s = c.MIN_SPEED / Math.sqrt(sp2); nvx *= s; nvy *= s; }
+          else { const a = rand() * Math.PI * 2; nvx = Math.cos(a) * c.MIN_SPEED; nvy = Math.sin(a) * c.MIN_SPEED; }
+        }
+
+        vx[i] = nvx; vy[i] = nvy;
+      }
+
+      /* ---- 第二遍：位移 + 边界反弹 + 色相缓慢漂移 ---- */
+      for (let i = 0; i < N; i++) {
+        px[i] += vx[i] * ds;
+        py[i] += vy[i] * ds;
+        if (px[i] < 0) { px[i] = 0; vx[i] = Math.abs(vx[i]); }
+        else if (px[i] > W) { px[i] = W; vx[i] = -Math.abs(vx[i]); }
+        if (py[i] < 0) { py[i] = 0; vy[i] = Math.abs(vy[i]); }
+        else if (py[i] > H) { py[i] = H; vy[i] = -Math.abs(vy[i]); }
+        this.hue[i] += (-vy[i]) * c.HUE_DRIFT * ds;
+      }
+
+      return this;
+    }
+  }
+
+  const API = { Boids, DEFAULTS, PHASES, BASE_DIAG, smoothstep, mulberry32 };
+  root.BoidsPhysics = API;
+})(typeof globalThis !== 'undefined' ? globalThis : this);
+/* ===== KERNEL:END ===== */
+
+/* ============================================================================
+   渲染
+   ========================================================================== */
+const canvas = document.getElementById('scene');
+const ctx = canvas.getContext('2d');
+const hudCanvas = document.getElementById('hud');
+const hctx = hudCanvas.getContext('2d');
+
+function rgb(hex) {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
+}
+const BG = rgb('#03060f');
+const BG_CSS = `rgb(${BG[0]}, ${BG[1]}, ${BG[2]})`;
+
+const { Boids, PHASES } = window.BoidsPhysics;
+
+const boids = new Boids({
+  count: birdCount,
+  width: window.innerWidth,
+  height: window.innerHeight,
+  config: CONFIG,
+});
+
+let W = 0, H = 0, DPR = 1;
+function resize() {
+  DPR = Math.min(2, window.devicePixelRatio || 1);
+  W = window.innerWidth;
+  H = window.innerHeight;
+
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+
+  /* HUD 用固定 CSS 尺寸的位图，避免高 DPI 下文字重排 */
+  hudCanvas.width = W;
+  hudCanvas.height = H;
+  hudCanvas.style.width = W + 'px';
+  hudCanvas.style.height = H + 'px';
+
+  boids.resize(W, H);
+
+  ctx.fillStyle = BG_CSS;
+  ctx.fillRect(0, 0, W, H);
+}
+window.addEventListener('resize', resize);
+resize();
+
+/* ---------- 鸟体精灵：按色相分桶，避免逐只 createRadialGradient ---------- */
+const SPRITE_BINS = 48;
+const HUE_SPAN = 360;
+const sprites = [];
+
+function buildSprites() {
+  sprites.length = 0;
+  const size = boids.birdSize;
+  /* 白色鸟：只建一组精灵（不再按色相分桶） */
+  if (CONFIG.BIRD_WHITE) {
+    sprites.push({
+      hue: 0,
+      glow: makeSpriteWhite(size, CONFIG.GLOW_SCALE, CONFIG.TINT_GLOW, CONFIG.L_GLOW, CONFIG.GLOW_ALPHA),
+      mid: makeSpriteWhite(size, 1.6, CONFIG.TINT_MID, CONFIG.L_MID, CONFIG.MID_ALPHA),
+      core: makeSpriteWhite(size, 1.0, CONFIG.TINT_CORE, CONFIG.L_CORE, CONFIG.CORE_ALPHA),
+    });
+    return;
+  }
+  for (let b = 0; b < SPRITE_BINS; b++) {
+    const h = (b / SPRITE_BINS) * HUE_SPAN;
+    sprites.push({
+      hue: h,
+      glow: makeSprite(size, h, CONFIG.GLOW_SCALE, CONFIG.L_GLOW, CONFIG.SAT_GLOW, CONFIG.GLOW_ALPHA),
+      mid: makeSprite(size, h, 1.6, CONFIG.L_MID, CONFIG.SAT_MID, CONFIG.MID_ALPHA),
+      core: makeSprite(size, h, 1.0, CONFIG.L_CORE, CONFIG.SAT_CORE, CONFIG.CORE_ALPHA),
+    });
+  }
+}
+
+/* 白色鸟体：按亮度 L 与 RGB 配比上色（配比全为 1 就是纯白） */
+function makeSpriteWhite(size, scale, tint, l, alpha) {
+  const reach = size * 2 * scale + 6;
+  const pad = Math.ceil(reach);
+  const w = pad * 2;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = w;
+  const g = cv.getContext('2d');
+  g.translate(pad, pad);
+  g.beginPath();
+  g.moveTo(size * 2 * scale, 0);
+  g.lineTo(-size * scale, -size * 0.7 * scale);
+  g.lineTo(-size * 0.3 * scale, 0);
+  g.lineTo(-size * scale, size * 0.7 * scale);
+  g.closePath();
+  /* 以 L 作为白度（0~100 → 0~255），再乘配比 */
+  const base = (l / 100) * 255;
+  const t = tint || [1, 1, 1];
+  const r = Math.round(Math.min(255, base * t[0]));
+  const gg = Math.round(Math.min(255, base * t[1]));
+  const b2 = Math.round(Math.min(255, base * t[2]));
+  g.fillStyle = `rgba(${r}, ${gg}, ${b2}, ${alpha})`;
+  g.fill();
+  return { canvas: cv, pad };
+}
+
+function makeSprite(size, h, scale, l, sat, alpha) {
+  const reach = size * 2 * scale + 6;
+  const pad = Math.ceil(reach);
+  const w = pad * 2;
+  const cv = document.createElement('canvas');
+  cv.width = w; cv.height = w;
+  const g = cv.getContext('2d');
+  g.translate(pad, pad);
+  g.beginPath();
+  g.moveTo(size * 2 * scale, 0);
+  g.lineTo(-size * scale, -size * 0.7 * scale);
+  g.lineTo(-size * 0.3 * scale, 0);
+  g.lineTo(-size * scale, size * 0.7 * scale);
+  g.closePath();
+  g.fillStyle = `hsla(${h}, ${sat}%, ${l}%, ${alpha})`;
+  g.fill();
+  return { canvas: cv, pad };
+}
+
+function spriteFor(hue, rebel) {
+  /* 白色模式：只有一组精灵，忽略色相 */
+  if (CONFIG.BIRD_WHITE) return sprites[0];
+  let h = hue;
+  if (rebel) h += CONFIG.REBEL_HUE_SHIFT;
+  if (!Number.isFinite(h)) h = CONFIG.HUE_BASE;
+  h = ((h % 360) + 360) % 360;
+  const idx = Math.min(SPRITE_BINS - 1, Math.floor((h / HUE_SPAN) * SPRITE_BINS));
+  return sprites[Math.max(0, idx)];
+}
+
+/* ---------- 游隼（鼠标 = 惊散）----------
+   用 Pointer Events + setPointerCapture：
+   按住按键拖动时，浏览器默认的指针捕获 / 宿主窗口拖动会让 mousemove 被重定向，
+   表现就是"游隼卡在原地不再跟随鼠标"。显式捕获指针后，拖动期间页面仍持续收到
+   pointermove，窗口外的位移也照样跟踪；指针离开窗口才停止惊散。
+
+   面板已固定关闭，所以这里**没有任何点击副作用** ——
+   左键、右键、双击都只用于惊散，不会切换任何 UI。 */
+const predator = { x: -9999, y: -9999, active: false };
+let lastLocalDisturb = -1e9;
+let pointerDown = false;
+
+function predatorAt(x, y) {
+  if (!predatorEnabled) return;
+  predator.x = x;
+  predator.y = y;
+  predator.active = true;
+}
+function predatorOff() {
+  predator.active = false;
+  predator.x = -9999;
+  predator.y = -9999;
+}
+
+if (window.PointerEvent) {
+  window.addEventListener('pointermove', (e) => { predatorAt(e.clientX, e.clientY); }, { passive: true });
+  window.addEventListener('pointerdown', (e) => {
+    pointerDown = true;
+    predatorAt(e.clientX, e.clientY);
+    if (e.target && e.target.setPointerCapture && e.pointerId !== undefined) {
+      try { e.target.setPointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+    }
+  });
+  window.addEventListener('pointerup', (e) => {
+    pointerDown = false;
+    predatorAt(e.clientX, e.clientY);
+    if (e.target && e.target.releasePointerCapture && e.pointerId !== undefined) {
+      try { e.target.releasePointerCapture(e.pointerId); } catch (err) { /* 忽略 */ }
+    }
+  });
+  window.addEventListener('pointercancel', () => { pointerDown = false; predatorOff(); });
+  window.addEventListener('pointerleave', () => { if (!pointerDown) predatorOff(); });
+} else {
+  window.addEventListener('mousemove', (e) => { predatorAt(e.clientX, e.clientY); }, { passive: true });
+  window.addEventListener('mousedown', (e) => { pointerDown = true; predatorAt(e.clientX, e.clientY); });
+  window.addEventListener('mouseup', (e) => { pointerDown = false; predatorAt(e.clientX, e.clientY); });
+  window.addEventListener('mouseleave', () => { if (!pointerDown) predatorOff(); });
+  window.addEventListener('touchmove', (e) => {
+    const t = e.touches[0];
+    predatorAt(t.clientX, t.clientY);
+    e.preventDefault();
+  }, { passive: false });
+  window.addEventListener('touchstart', (e) => {
+    const t = e.touches[0];
+    predatorAt(t.clientX, t.clientY);
+  }, { passive: true });
+  window.addEventListener('touchend', () => { predatorOff(); });
+}
+window.addEventListener('blur', () => { pointerDown = false; predatorOff(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) { pointerDown = false; predatorOff(); }
+});
+
+/* 面板状态：固定关闭，只需记住"画布是否已清过一次" */
+let hudCleared = false;
+
+/* ---------- 键盘：打乱 / 定时打乱 / 复位 / HUD ---------- */
+window.addEventListener('keydown', (e) => {
+  const k = e.key.toLowerCase();
+  if (k === ' ') {
+    boids.disturb(performance.now());
+    e.preventDefault();
+  } else if (k === 'd') {
+    /* 定时打乱开关：默认关，极限环自持不间断 */
+    CONFIG.AUTO_DISTURB = !CONFIG.AUTO_DISTURB;
+    if (CONFIG.AUTO_DISTURB) boids.armAutoDisturb();
+    else boids.autoDisturbAt = Infinity;
+  } else if (k === 'r') {
+    boids.initRibbon();
+    ctx.fillStyle = BG_CSS;
+    ctx.fillRect(0, 0, W, H);
+    clearTrace();
+  } else if (k === 'h') {
+    /* 面板固定关闭；如需临时查看，把 CONFIG.HUD 改成 true 后重新打开页面 */
+  }
+});
+
+/* ---------- HUD：半径/环流曲线 + 状态读数（极限环与恢复都由此可读） ---------- */
+const TRACE_MAX = 1600;
+const traceR = new Float32Array(TRACE_MAX);
+const traceRot = new Float32Array(TRACE_MAX);
+let traceLen = 0, traceHead = 0;
+
+function pushTrace(r, rot) {
+  traceR[traceHead] = r;
+  traceRot[traceHead] = rot;
+  traceHead = (traceHead + 1) % TRACE_MAX;
+  if (traceLen < TRACE_MAX) traceLen++;
+}
+function clearTrace() { traceLen = 0; traceHead = 0; }
+
+function drawHud() {
+  /* 面板固定关闭时不要每帧清画布：清一次由主循环负责，这里直接返回（省 CPU） */
+  if (!CONFIG.HUD) return;
+  hctx.clearRect(0, 0, W, H);
+
+  const panelW = Math.min(560, W - 48);
+  const panelH = 176;
+  const px0 = W - panelW - 24;
+  const py0 = 24;
+
+  hctx.save();
+  hctx.fillStyle = 'rgba(4, 9, 20, 0.62)';
+  hctx.strokeStyle = 'rgba(120, 190, 255, 0.16)';
+  hctx.lineWidth = 1;
+  roundRect(hctx, px0, py0, panelW, panelH, 10);
+  hctx.fill();
+  hctx.stroke();
+
+  hctx.font = '12px ui-monospace, SFMono-Regular, Menlo, monospace';
+  hctx.textBaseline = 'top';
+
+  const phaseName = PHASES[boids.phase] || boids.phase;
+  const cohPct = (boids.coherence * 100).toFixed(0);
+  const cycleName = boids.relayOn ? '膨胀段' : '回缩段';
+  hctx.fillStyle = 'rgba(170, 215, 255, 0.92)';
+  hctx.fillText('极限环  ' + cycleName + '   ·   ' + phaseName, px0 + 14, py0 + 12);
+
+  const gatePct = (boids.millGate * 100).toFixed(0);
+  hctx.fillStyle = 'rgba(140, 185, 235, 0.80)';
+  hctx.fillText(
+    '半径 ' + boids.clusterRadius.toFixed(0) +
+    ' / 目标 ' + boids.ringTarget.toFixed(0) +
+    '   环流有序度 ' + cohPct + '%' +
+    '   成环闸门 ' + gatePct + '%',
+    px0 + 14, py0 + 32);
+  hctx.fillStyle = 'rgba(120, 165, 215, 0.72)';
+  hctx.fillText(
+    '定时打乱 ' + (CONFIG.AUTO_DISTURB ? '开（D 关闭）' : '关（D 开启）') +
+    '   打乱后剩余环流 ' + boids.disturbRatio.toFixed(2) +
+    '   鸟 ' + boids.N,
+    px0 + 14, py0 + 50);
+
+  /* 曲线区 */
+  const gx = px0 + 14, gy = py0 + 74, gw = panelW - 28, gh = panelH - 92;
+  hctx.strokeStyle = 'rgba(120, 190, 255, 0.14)';
+  hctx.beginPath();
+  hctx.moveTo(gx, gy + gh);
+  hctx.lineTo(gx + gw, gy + gh);
+  hctx.stroke();
+
+  if (traceLen > 1) {
+    const rMax = boids.targetRadius * 1.9;
+    const rotMax = CONFIG.MAX_SPEED;
+
+    /* 半径曲线（青色） */
+    hctx.strokeStyle = 'rgba(120, 220, 255, 0.85)';
+    hctx.lineWidth = 1.4;
+    hctx.beginPath();
+    for (let i = 0; i < traceLen; i++) {
+      const idx = (traceHead - traceLen + i + TRACE_MAX * 2) % TRACE_MAX;
+      const x = gx + (i / (traceLen - 1)) * gw;
+      const y = gy + gh - Math.min(1, traceR[idx] / rMax) * gh;
+      if (i === 0) hctx.moveTo(x, y); else hctx.lineTo(x, y);
+    }
+    hctx.stroke();
+
+    /* 环流曲线（橙色）：掉到 0 = 被打乱，随后爬升 = 恢复 */
+    hctx.strokeStyle = 'rgba(255, 176, 84, 0.80)';
+    hctx.lineWidth = 1.2;
+    hctx.beginPath();
+    for (let i = 0; i < traceLen; i++) {
+      const idx = (traceHead - traceLen + i + TRACE_MAX * 2) % TRACE_MAX;
+      const x = gx + (i / (traceLen - 1)) * gw;
+      const y = gy + gh - Math.min(1, Math.abs(traceRot[idx]) / rotMax) * gh;
+      if (i === 0) hctx.moveTo(x, y); else hctx.lineTo(x, y);
+    }
+    hctx.stroke();
+
+    /* 目标半径参考线 */
+    hctx.strokeStyle = 'rgba(120, 190, 255, 0.18)';
+    hctx.lineWidth = 1;
+    hctx.setLineDash([3, 4]);
+    const yRef = gy + gh - Math.min(1, boids.targetRadius / rMax) * gh;
+    hctx.beginPath();
+    hctx.moveTo(gx, yRef);
+    hctx.lineTo(gx + gw, yRef);
+    hctx.stroke();
+    hctx.setLineDash([]);
+  }
+
+  hctx.fillStyle = 'rgba(140, 185, 235, 0.62)';
+  hctx.fillText('半径', gx, gy - 12);
+  hctx.fillStyle = 'rgba(255, 176, 84, 0.78)';
+  hctx.fillText('环流', gx + 40, gy - 12);
+  hctx.fillStyle = 'rgba(120, 165, 215, 0.55)';
+  hctx.fillText('空格 打乱   R 复位   H 隐藏面板   鼠标 游隼惊散', gx + 100, gy - 12);
+
+  hctx.restore();
+}
+
+function roundRect(g, x, y, w, h, r) {
+  g.beginPath();
+  g.moveTo(x + r, y);
+  g.arcTo(x + w, y, x + w, y + h, r);
+  g.arcTo(x + w, y + h, x, y + h, r);
+  g.arcTo(x, y + h, x, y, r);
+  g.arcTo(x, y, x + w, y, r);
+  g.closePath();
+}
+
+/* ---------- 主循环 ---------- */
+let lastTime = 0;
+const FRAME_INTERVAL = 1000 / 60;
+const ROT_FOR_HUE = 6.0;
+
+function render() {
+  ctx.fillStyle = `rgba(${BG[0]}, ${BG[1]}, ${BG[2]}, ${CONFIG.TRAIL_ALPHA})`;
+  ctx.fillRect(0, 0, W, H);
+
+  /* 游隼光晕 */
+  if (predator.active) {
+    const rad = boids.predatorRadius;
+    const grad = ctx.createRadialGradient(predator.x, predator.y, 0, predator.x, predator.y, rad);
+    grad.addColorStop(0, 'rgba(255, 70, 140, 0.085)');
+    grad.addColorStop(0.5, 'rgba(200, 45, 120, 0.032)');
+    grad.addColorStop(1, 'rgba(180, 30, 100, 0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(predator.x, predator.y, rad, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const px = boids.px, py = boids.py, vx = boids.vx, vy = boids.vy;
+  const hue = boids.hue, isRebel = boids.isRebel;
+  const N = boids.N;
+
+  for (let i = 0; i < N; i++) {
+    const angle = Math.atan2(vy[i], vx[i]);
+    const spd = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]);
+    const h = hue[i] - spd * CONFIG.SPEED_HUE_GAIN;
+    const sp = spriteFor(h, isRebel[i]);
+    const a = sp.glow.pad;
+
+    ctx.save();
+    ctx.translate(px[i], py[i]);
+    ctx.rotate(angle);
+    ctx.drawImage(sp.glow.canvas, -a, -a);
+    ctx.restore();
+  }
+
+  for (let i = 0; i < N; i++) {
+    const angle = Math.atan2(vy[i], vx[i]);
+    const spd = Math.sqrt(vx[i] * vx[i] + vy[i] * vy[i]);
+    const h = hue[i] - spd * CONFIG.SPEED_HUE_GAIN;
+    const sp = spriteFor(h, isRebel[i]);
+    const a = sp.core.pad;
+
+    ctx.save();
+    ctx.translate(px[i], py[i]);
+    ctx.rotate(angle);
+    ctx.drawImage(sp.mid.canvas, -a, -a);
+    ctx.drawImage(sp.core.canvas, -a, -a);
+    ctx.restore();
+  }
+
+  /* 打乱瞬间的闪光：以鸟群质心为中心的一次性亮场，
+     让"打乱 → 环流归零 → 重新成环"的过程一眼可辨（瞬时、不改变整体配色） */
+  if (boids.flash > 0.01) {
+    const rad = Math.max(160, boids.clusterRadius * 1.7);
+    const k = Math.min(1, boids.flash) * 0.085;
+    const grad = ctx.createRadialGradient(boids.gcx, boids.gcy, 0, boids.gcx, boids.gcy, rad);
+    grad.addColorStop(0, `rgba(214, 238, 255, ${k.toFixed(3)})`);
+    grad.addColorStop(0.45, `rgba(150, 200, 240, ${(k * 0.45).toFixed(3)})`);
+    grad.addColorStop(1, 'rgba(120, 170, 220, 0)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    ctx.arc(boids.gcx, boids.gcy, rad, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+let traceAcc = 0;
+function loop(timestamp) {
+  requestAnimationFrame(loop);
+  if (!lastTime) lastTime = timestamp;
+  const delta = timestamp - lastTime;
+  if (delta < FRAME_INTERVAL - 2) return;
+  lastTime = timestamp;
+
+  boids.step(Math.min(0.05, delta / 1000), timestamp, predatorEnabled ? predator : null);
+  render();
+
+  /* 曲线按固定时间采样，不随帧率变化 */
+  traceAcc += delta;
+  if (traceAcc >= 33) {
+    traceAcc = 0;
+    pushTrace(boids.clusterRadius, boids.tangential);
+  }
+  /* 面板固定关闭：只在第一次清一次画布，之后完全跳过绘制（省 CPU） */
+  if (!CONFIG.HUD && !hudCleared) { hctx.clearRect(0, 0, W, H); hudCleared = true; }
+  drawHud();
+}
+
+window.__BOIDS__ = { CONFIG, get boids() { return boids; }, get predator() { return predator; },
+  get predatorEnabled() { return predatorEnabled; } };
+
+buildSprites();
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
